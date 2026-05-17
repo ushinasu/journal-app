@@ -439,10 +439,32 @@ function EnvBanner(){
   );
 }
 
-// ── SETUP: STORAGE (local only) ───────────────────────────────
-function StorageSetup({onComplete}){
+// ── SETUP: STORAGE ────────────────────────────────────────────
+function StorageSetup({onComplete, onGdrive}){
   const [picking,setPicking]=useState(false);
+  const [showGdrive,setShowGdrive]=useState(false);
+  const [gdriveCid,setGdriveCid]=useState("");
+  const [gdriveConnecting,setGdriveConnecting]=useState(false);
+  const [gdriveErr,setGdriveErr]=useState("");
+
   async function chooseLocal(){ setPicking(true); const h=await pickDirectory(); setPicking(false); if(h) onComplete("local",h); }
+
+  async function connectGdrive(){
+    if(!gdriveCid.trim()){ setGdriveErr("Client IDを入力してください"); return; }
+    setGdriveConnecting(true); setGdriveErr("");
+    try{
+      const token=await gdriveAuth(gdriveCid.trim());
+      let fileId=await gdriveSearch(token);
+      let loadedSessions=null;
+      if(fileId){ try{ loadedSessions=await gdriveRead(token,fileId); }catch(e){} }
+      else{ fileId=await gdriveWrite(token,null,[]); }
+      onGdrive(gdriveCid.trim(),token,fileId,loadedSessions);
+    }catch(e){
+      setGdriveErr("接続失敗: "+e.message);
+    }
+    setGdriveConnecting(false);
+  }
+
   return(
     <div style={{minHeight:"100vh",backgroundColor:C.bg,display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
       <div style={{width:"100%",maxWidth:440}}>
@@ -463,6 +485,35 @@ function StorageSetup({onComplete}){
               {picking&&<div style={{display:"flex",justifyContent:"center",marginTop:12}}><Spinner/></div>}
             </div>
           )}
+
+          {/* Google Drive */}
+          <div style={{backgroundColor:C.card,borderRadius:14,padding:"20px",border:`1px solid ${showGdrive?C.accent:C.border}`,cursor:"default"}}>
+            <div onClick={()=>setShowGdrive(!showGdrive)} style={{display:"flex",alignItems:"center",gap:10,marginBottom:showGdrive?12:0,cursor:"pointer"}}>
+              <span style={{fontSize:22}}>☁</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:15,fontWeight:700,color:C.text}}>Google Driveに保存 <span style={{fontSize:11,color:C.accentDim}}>推奨（スマホ）</span></div>
+                <div style={{fontSize:11,color:C.textDim,marginTop:2}}>PC・スマホで同期できます</div>
+              </div>
+              <span style={{color:C.textDim,fontSize:12}}>{showGdrive?"▾":"▸"}</span>
+            </div>
+            {showGdrive&&(
+              <div>
+                <div style={{fontSize:11,color:C.textDim,lineHeight:1.8,marginBottom:10}}>
+                  Google Cloud ConsoleでOAuth Client IDを取得して入力してください。<br/>
+                  接続するとDriveに <b style={{color:C.text}}>journal-data.json</b> が作成されます。
+                </div>
+                <input value={gdriveCid} onChange={e=>{setGdriveCid(e.target.value);setGdriveErr("");}}
+                  placeholder="xxxx.apps.googleusercontent.com"
+                  style={{width:"100%",backgroundColor:C.bg,border:`1px solid ${gdriveErr?C.err:C.border}`,borderRadius:8,padding:"9px 12px",color:C.text,fontSize:11,outline:"none",marginBottom:8,boxSizing:"border-box",fontFamily:"monospace"}}/>
+                {gdriveErr&&<div style={{fontSize:11,color:C.err,marginBottom:8}}>{gdriveErr}</div>}
+                <button onClick={connectGdrive} disabled={gdriveConnecting}
+                  style={{width:"100%",padding:"10px",borderRadius:8,backgroundColor:gdriveConnecting?C.card:C.accentDim,border:`1px solid ${C.accent}`,color:C.accent,fontSize:13,cursor:gdriveConnecting?"default":"pointer",fontWeight:600}}>
+                  {gdriveConnecting?"接続中...":"Googleアカウントで接続する"}
+                </button>
+              </div>
+            )}
+          </div>
+
           <div onClick={()=>onComplete("browser",null)} style={{backgroundColor:C.card,borderRadius:14,padding:"20px",border:`1px solid ${C.border}`,cursor:"pointer"}}>
             <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}><span style={{fontSize:22}}>🌐</span><div style={{fontSize:15,fontWeight:700,color:C.text}}>ブラウザ内に保存</div></div>
             <div style={{fontSize:12,color:C.textSec,lineHeight:1.7}}>ブラウザのlocalStorageに保存します。手軽ですがデータ削除で消える可能性があります。</div>
@@ -1607,7 +1658,14 @@ function App(){
   async function deleteSession(id){ const u=sessions.filter(s=>s.id!==id); await persist(u); setSel(null); showToast("削除しました","ok"); }
 
   if(phase==="loading") return <div style={{minHeight:"100vh",backgroundColor:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:16}}><Spinner/><div style={{color:C.textDim,fontSize:13}}>読み込み中...</div></div></div>;
-  if(phase==="storageSetup") return <StorageSetup onComplete={handleStorageChoice}/>;
+  if(phase==="storageSetup") return <StorageSetup onComplete={handleStorageChoice} onGdrive={async(clientId,token,fileId,loadedSessions)=>{
+    await store.set(KEY_GDRIVE_CLIENT_ID,clientId); setGdriveClientId(clientId);
+    await store.set(KEY_GDRIVE_FILE_ID,fileId);     setGdriveFileId(fileId);
+    await store.set(KEY_SAVE_MODE,"gdrive");        setSaveMode("gdrive");
+    setGdriveToken(token);
+    if(loadedSessions) setSessions(loadedSessions);
+    setPhase("modelSetup");
+  }}/>;
   if(phase==="modelSetup") return <ModelSetup onSave={handleModelSave} isClaude={IS_CLAUDE}/>;
   if(phase==="folderPick") return <FolderRepick onPicked={handleFolderPick} onSwitchToBrowser={handleSwitchToBrowser}/>;
 
