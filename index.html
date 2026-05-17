@@ -9,6 +9,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *{box-sizing:border-box;margin:0;padding:0;}
@@ -46,9 +47,11 @@ const C = {
 // Storage keys
 const KEY_APIKEY    = "journal:apikey";      // {gemini,gpt,claude} keys
 const KEY_MODEL     = "journal:model";        // selected model id
-const KEY_SAVE_MODE = "journal:savemode";
-const KEY_SESSIONS  = "journal:sessions:v1";
-const DATA_FILENAME = "journal-data.json";
+const KEY_SAVE_MODE        = "journal:savemode";
+const KEY_SESSIONS         = "journal:sessions:v1";
+const KEY_GDRIVE_CLIENT_ID = "journal:gdrive:clientid";
+const KEY_GDRIVE_FILE_ID   = "journal:gdrive:fileid";
+const DATA_FILENAME        = "journal-data.json";
 const IDB_NAME      = "journal-idb";
 const IDB_STORE     = "handles";
 const IDB_KEY       = "dirHandle";
@@ -196,6 +199,71 @@ function openIDB(){
 async function idbGet(key){ const db=await openIDB(); return new Promise((res,rej)=>{ const req=db.transaction(IDB_STORE,"readonly").objectStore(IDB_STORE).get(key); req.onsuccess=e=>res(e.target.result); req.onerror=e=>rej(e.target.error); }); }
 async function idbSet(key,val){ const db=await openIDB(); return new Promise((res,rej)=>{ const tx=db.transaction(IDB_STORE,"readwrite"); tx.objectStore(IDB_STORE).put(val,key); tx.oncomplete=()=>res(); tx.onerror=e=>rej(e.target.error); }); }
 async function idbDel(key){ const db=await openIDB(); return new Promise((res,rej)=>{ const tx=db.transaction(IDB_STORE,"readwrite"); tx.objectStore(IDB_STORE).delete(key); tx.oncomplete=()=>res(); tx.onerror=e=>rej(e.target.error); }); }
+
+// ── GOOGLE DRIVE ──────────────────────────────────────────────
+let _gisClient = null;
+
+async function gdriveAuth(clientId, silent=false){
+  return new Promise((resolve, reject)=>{
+    if(!window.google?.accounts?.oauth2){
+      reject(new Error("Google認証ライブラリが読み込まれていません。ページを再読み込みしてください。"));
+      return;
+    }
+    if(!_gisClient || _gisClient._cid !== clientId){
+      _gisClient = google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: "https://www.googleapis.com/auth/drive.file",
+        callback: "",
+      });
+      _gisClient._cid = clientId;
+    }
+    _gisClient.callback = (resp)=>{
+      if(resp.error) reject(new Error(resp.error_description || resp.error));
+      else resolve(resp.access_token);
+    };
+    _gisClient.requestAccessToken({ prompt: silent ? "" : "consent" });
+  });
+}
+
+async function gdriveSearch(token){
+  const res = await fetch(
+    "https://www.googleapis.com/drive/v3/files?q=name%3D'journal-data.json'+and+trashed%3Dfalse&fields=files(id)",
+    { headers:{ Authorization:`Bearer ${token}` } }
+  );
+  const data = await res.json();
+  if(data.error) throw new Error(data.error.message);
+  return data.files?.[0]?.id || null;
+}
+
+async function gdriveRead(token, fileId){
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+    { headers:{ Authorization:`Bearer ${token}` } }
+  );
+  if(!res.ok) throw new Error("ファイル読み込みに失敗しました");
+  return res.json();
+}
+
+async function gdriveWrite(token, fileId, sessions){
+  const body = JSON.stringify(sessions);
+  if(!fileId){
+    const metaRes = await fetch("https://www.googleapis.com/drive/v3/files", {
+      method:"POST",
+      headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" },
+      body: JSON.stringify({ name:"journal-data.json", mimeType:"application/json" })
+    });
+    const meta = await metaRes.json();
+    if(meta.error) throw new Error(meta.error.message);
+    fileId = meta.id;
+  }
+  const res = await fetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+    { method:"PATCH", headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" }, body }
+  );
+  const data = await res.json();
+  if(data.error) throw new Error(data.error.message);
+  return fileId;
+}
 
 // ── FILE SYSTEM (local only) ──────────────────────────────────
 const fsSupported=!IS_CLAUDE && typeof window.showDirectoryPicker==="function";
@@ -488,15 +556,37 @@ function FolderRepick({onPicked,onSwitchToBrowser}){
 }
 
 // ── SETTINGS VIEW ─────────────────────────────────────────────
-function SettingsView({modelId,apiKeys,saveMode,dirHandle,onUpdateModel,onChangeFolder,onSwitchMode,onClose,showToast}){
+function SettingsView({modelId,apiKeys,saveMode,dirHandle,gdriveClientId,gdriveToken,gdriveFileId,onUpdateModel,onChangeFolder,onSwitchMode,onGdriveConnect,onGdriveDisconnect,onClose,showToast}){
   const [selModel,setSelModel]=useState(modelId);
   const [keys,setKeys]=useState({...apiKeys});
   const [visible,setVisible]=useState({});
   const [picking,setPicking]=useState(false);
+  const [gdriveCid,setGdriveCid]=useState(gdriveClientId||"");
+  const [gdriveConnecting,setGdriveConnecting]=useState(false);
 
   async function saveModel(){
     onUpdateModel(selModel,keys);
     showToast("設定を更新しました","ok");
+  }
+
+  async function connectGdrive(){
+    if(!gdriveCid.trim()){ showToast("Client IDを入力してください","err"); return; }
+    setGdriveConnecting(true);
+    try{
+      const token = await gdriveAuth(gdriveCid.trim());
+      // Find existing file or create new one
+      let fileId = await gdriveSearch(token);
+      let loadedSessions = null;
+      if(fileId){
+        try{ loadedSessions = await gdriveRead(token, fileId); }catch(e){}
+      } else {
+        fileId = await gdriveWrite(token, null, []);
+      }
+      await onGdriveConnect(gdriveCid.trim(), token, fileId, loadedSessions);
+    }catch(e){
+      showToast("接続失敗: "+e.message,"err");
+    }
+    setGdriveConnecting(false);
   }
   async function changeFolder(){ setPicking(true); const h=await pickDirectory(); setPicking(false); if(h){ onChangeFolder(h); showToast("フォルダを変更しました","ok"); } }
   async function switchToLocal(){ const h=await pickDirectory(); if(!h) return; onSwitchMode("local",h); showToast("ローカル保存に切り替えました","ok"); }
@@ -563,6 +653,37 @@ function SettingsView({modelId,apiKeys,saveMode,dirHandle,onUpdateModel,onChange
             <button onClick={switchToBrowser} style={{width:"100%",padding:"9px",borderRadius:8,backgroundColor:"transparent",border:`1px solid ${C.border}`,color:C.textSec,fontSize:12,cursor:"pointer"}}>🌐 ブラウザ保存に切り替え</button></>
           ):fsSupported&&(
             <button onClick={switchToLocal} style={{width:"100%",padding:"9px",borderRadius:8,backgroundColor:C.accentDim,border:`1px solid ${C.accent}`,color:C.accent,fontSize:12,cursor:"pointer"}}>📁 ローカル保存に切り替え</button>
+          )}
+        </Section>
+      )}
+
+      {/* GOOGLE DRIVE */}
+      {!IS_CLAUDE&&(
+        <Section title="Google Drive 同期">
+          {saveMode==="gdrive"&&gdriveToken?(
+            <div>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+                <span style={{width:8,height:8,borderRadius:"50%",backgroundColor:C.ok,display:"inline-block"}}/>
+                <span style={{fontSize:12,color:C.ok}}>接続中</span>
+                <span style={{fontSize:11,color:C.textDim,marginLeft:4}}>journal-data.json をDriveに自動保存</span>
+              </div>
+              <button onClick={onGdriveDisconnect} style={{width:"100%",padding:"9px",borderRadius:8,backgroundColor:"transparent",border:`1px solid ${C.border}`,color:C.textSec,fontSize:12,cursor:"pointer"}}>接続を解除してブラウザ保存に戻す</button>
+            </div>
+          ):(
+            <div>
+              {saveMode==="gdrive"&&!gdriveToken&&(
+                <div style={{fontSize:11,color:C.accent,marginBottom:10,padding:"8px 10px",backgroundColor:C.accentBg,borderRadius:8}}>⚠ Drive接続が切れています。再接続してください。</div>
+              )}
+              <div style={{fontSize:11,color:C.textDim,lineHeight:1.8,marginBottom:10}}>
+                Google Cloud ConsoleでOAuth Client IDを取得して入力してください。<br/>
+                接続するとDriveに <b style={{color:C.text}}>journal-data.json</b> が作成され、PC・スマホで同期できます。
+              </div>
+              <input value={gdriveCid} onChange={e=>setGdriveCid(e.target.value)} placeholder="Google OAuth Client ID (xxxx.apps.googleusercontent.com)"
+                style={{width:"100%",backgroundColor:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 12px",color:C.text,fontSize:11,outline:"none",marginBottom:8,boxSizing:"border-box",fontFamily:"monospace"}}/>
+              <button onClick={connectGdrive} disabled={gdriveConnecting} style={{width:"100%",padding:"9px",borderRadius:8,backgroundColor:gdriveConnecting?C.card:C.accentDim,border:`1px solid ${C.accent}`,color:C.accent,fontSize:12,cursor:gdriveConnecting?"default":"pointer"}}>
+                {gdriveConnecting?"接続中...":"Googleアカウントで接続する"}
+              </button>
+            </div>
           )}
         </Section>
       )}
@@ -1394,6 +1515,9 @@ function App(){
   const [savedMeta,setSavedMeta]=useState(null);
   const [sessionId,setSessionId]=useState(()=>`s_${Date.now()}`);
   const [installPrompt,setInstallPrompt]=useState(null);
+  const [gdriveToken,setGdriveToken]=useState(null);
+  const [gdriveClientId,setGdriveClientId]=useState("");
+  const [gdriveFileId,setGdriveFileId]=useState(null);
 
   function showToast(msg,type="info"){ setToast({msg,type}); setTimeout(()=>setToast({msg:"",type:""}),3000); }
 
@@ -1401,6 +1525,14 @@ function App(){
     setSessions(updated);
     if(IS_CLAUDE){
       await store.set(KEY_SESSIONS,JSON.stringify(updated));
+    } else if(saveMode==="gdrive"&&gdriveToken){
+      try{
+        const newId=await gdriveWrite(gdriveToken,gdriveFileId,updated);
+        if(newId!==gdriveFileId){ setGdriveFileId(newId); await store.set(KEY_GDRIVE_FILE_ID,newId); }
+      }catch(e){
+        showToast("⚠ Drive保存失敗: "+e.message,"err");
+        await store.set(KEY_SESSIONS,JSON.stringify(updated));
+      }
     } else if(saveMode==="local"&&dirHandle){
       const ok=await writeLocalFile(dirHandle,updated);
       if(!ok) showToast("⚠ ファイル保存に失敗しました","err");
@@ -1420,6 +1552,12 @@ function App(){
       if(savedModel) setModelId(savedModel);
       if(savedKeys){ try{ setApiKeys(JSON.parse(savedKeys)); }catch(e){} }
 
+      // Load Google Drive settings
+      const savedGdriveCid=await store.get(KEY_GDRIVE_CLIENT_ID);
+      const savedGdriveFid=await store.get(KEY_GDRIVE_FILE_ID);
+      if(savedGdriveCid) setGdriveClientId(savedGdriveCid);
+      if(savedGdriveFid) setGdriveFileId(savedGdriveFid);
+
       if(IS_CLAUDE){
         // Claude env: load from window.storage
         const raw=await store.get(KEY_SESSIONS);
@@ -1432,7 +1570,11 @@ function App(){
         const mode=await store.get(KEY_SAVE_MODE)||"";
         if(!mode){ setPhase("storageSetup"); return; }
         setSaveMode(mode);
-        if(mode==="local"){
+        if(mode==="gdrive"){
+          // Load local cache while user reconnects
+          const raw=await store.get(KEY_SESSIONS);
+          if(raw){ try{ const p=JSON.parse(raw); if(Array.isArray(p)) setSessions(p); }catch(e){} }
+        } else if(mode==="local"){
           const h=await getSavedDirHandle();
           if(h){ setDirHandle(h); setSessions(await readLocalFile(h)); }
           else{ if(!savedModel){ setPhase("storageSetup"); return; } setPhase("folderPick"); return; }
@@ -1507,9 +1649,23 @@ function App(){
       <div style={{flex:1,overflowY:"auto",paddingBottom:IS_CLAUDE?0:72}}>
         {showSettings?(
           <SettingsView modelId={modelId} apiKeys={apiKeys} saveMode={saveMode} dirHandle={dirHandle}
+            gdriveClientId={gdriveClientId} gdriveToken={gdriveToken} gdriveFileId={gdriveFileId}
             onUpdateModel={async(mid,keys)=>{ await store.set(KEY_MODEL,mid); await store.set(KEY_APIKEY,JSON.stringify(keys)); setModelId(mid); setApiKeys(keys); showToast("モデル設定を保存しました","ok"); }}
             onChangeFolder={async h=>{ setDirHandle(h); setSessions(await readLocalFile(h)); }}
             onSwitchMode={async(mode,h)=>{ await store.set(KEY_SAVE_MODE,mode); setSaveMode(mode); if(mode==="local"&&h){ setDirHandle(h); setSessions(await readLocalFile(h)); } else if(mode==="browser"){ setDirHandle(null); await idbDel(IDB_KEY); const raw=await store.get(KEY_SESSIONS); if(raw){try{const p=JSON.parse(raw);if(Array.isArray(p))setSessions(p);}catch(e){}} } }}
+            onGdriveConnect={async(clientId,token,fileId,loadedSessions)=>{
+              await store.set(KEY_GDRIVE_CLIENT_ID,clientId); setGdriveClientId(clientId);
+              await store.set(KEY_GDRIVE_FILE_ID,fileId);     setGdriveFileId(fileId);
+              await store.set(KEY_SAVE_MODE,"gdrive");        setSaveMode("gdrive");
+              setGdriveToken(token);
+              if(loadedSessions) setSessions(loadedSessions);
+              showToast("Google Driveと接続しました","ok");
+            }}
+            onGdriveDisconnect={async()=>{
+              await store.set(KEY_SAVE_MODE,"browser"); setSaveMode("browser");
+              setGdriveToken(null);
+              showToast("Drive接続を解除しました","info");
+            }}
             onClose={()=>setShowSettings(false)} showToast={showToast}/>
         ):sel?(
           <SessionDetail session={sel} onBack={()=>setSel(null)} onDelete={deleteSession}/>
