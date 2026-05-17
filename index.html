@@ -1,0 +1,1548 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Journal</title>
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#0d0c0a">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:#0d0c0a;font-family:'Noto Sans JP',sans-serif;}
+  ::-webkit-scrollbar{width:3px;}::-webkit-scrollbar-thumb{background:#2a2720;border-radius:2px;}
+  input::placeholder,textarea::placeholder{color:#4a4640;}
+  @keyframes pulse{0%,80%,100%{transform:scale(.6);opacity:.4}40%{transform:scale(1);opacity:1}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body><div id="root"></div>
+<script>
+if('serviceWorker' in navigator && !window.storage){
+  navigator.serviceWorker.register('./sw.js').catch(()=>{});
+}
+</script>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ── ENVIRONMENT DETECTION ─────────────────────────────────────
+// Claude artifact env has window.storage; local env does not
+const IS_CLAUDE = (()=>{
+  try{ return typeof window.storage !== 'undefined'; }catch(e){ return false; }
+})();
+
+const C = {
+  bg:"#1e1c1a",surface:"#262320",card:"#2e2b27",cardHover:"#35312c",
+  accent:"#c4975a",accentDim:"#8a6535",accentBg:"#2a2015",
+  text:"#e8e0d4",textSec:"#9a9088",textDim:"#5a5450",
+  border:"#3a3630",borderLight:"#4a4640",
+  ok:"#5a9a6a",okBg:"#162018",err:"#c06050",errBg:"#261612",
+  info:"#5a8aaa",infoBg:"#121e28",
+};
+
+// Storage keys
+const KEY_APIKEY    = "journal:apikey";      // {gemini,gpt,claude} keys
+const KEY_MODEL     = "journal:model";        // selected model id
+const KEY_SAVE_MODE = "journal:savemode";
+const KEY_SESSIONS  = "journal:sessions:v1";
+const DATA_FILENAME = "journal-data.json";
+const IDB_NAME      = "journal-idb";
+const IDB_STORE     = "handles";
+const IDB_KEY       = "dirHandle";
+
+const SYSTEM_PROMPT  = `これは個人の日記アプリです。日本語で自然に会話してください。`;
+
+const WEEKLY_PROMPT = `以下は1週間分の日記・振り返りの記録です。
+これらを分析して、以下の形式でJSONのみ返してください。前置きや説明は不要です。
+
+{
+  "period": "分析期間（例: 5/6〜5/12）",
+  "summary": "1週間全体の傾向を2〜3文で（エネルギー・集中力・気分の流れ）",
+  "patterns": [
+    {"title": "パターン名", "detail": "発見したパターンの説明（夜の行動→翌日の状態の相関など）"}
+  ],
+  "goodRoutine": "この週でパフォーマンスが良かった日の共通点",
+  "badRoutine": "この週でパフォーマンスが低かった日の共通点",
+  "suggestions": ["来週試してみると良い改善案1", "改善案2", "改善案3"],
+  "question": "来週深掘りしてみると良い問い（1つ）"
+}`;
+const EXTRACT_PROMPT = `以下の会話から重要な要素を抽出し、必ずJSON形式のみで返してください。前置きや説明は不要です。
+{"title":"会話の一言タイトル（15文字以内）","summary":"会話の核心（80文字以内）","tags":["タグ1","タグ2","タグ3"],"insights":["気づき1","気づき2"]}`;
+
+// 感情・違和感を含むセッション向けの深層分析プロンプト
+const BIAS_PROMPT = `以下の日記・振り返りの記録を読み、書いた人の思考パターンを分析してください。
+必ずJSON形式のみで返してください。前置きや説明は不要です。
+
+{
+  "trigger": "不快感・モヤモヤが発生したと思われる具体的なインプット（何があったか）",
+  "raw_reaction": "そのとき脳が瞬間的に出した感情・反応（社会的に綺麗にする前の野生の反応）",
+  "value_exposed": "その反応が示す、本人が大切にしている価値観・こだわり（正直に）",
+  "bias_pattern": "この反応に潜む可能性のある認知の偏りや思考の癖（批判ではなく観察として）",
+  "debug_question": "この思考パターンをさらに掘り下げるための問い（1つ）"
+}
+
+記録に感情的なトリガーや違和感が見当たらない場合は null を返してください。`;
+
+// 会話に感情トリガーが含まれているか判定
+function hasEmotionalContent(messages){
+  const emotionWords = ["モヤ","不快","イライラ","むかつ","嫌","違和感","なぜ","なんで","おかしい","許せ","腹","怒","悲","辛","苦し","不満","ストレス","疲れ","しんどい","理不尽"];
+  const text = messages.filter(m=>m.role==="user").map(m=>m.content).join(" ");
+  return emotionWords.some(w => text.includes(w));
+}
+
+// ── AI MODELS CONFIG ──────────────────────────────────────────
+const MODELS = {
+  claude: {
+    id:"claude",
+    label:"Claude",
+    desc: IS_CLAUDE ? "自動認証（キー不要）" : "APIキー必要",
+    requiresKey: !IS_CLAUDE,
+    keyPlaceholder:"sk-ant-...",
+  },
+  gemini: {
+    id:"gemini",
+    label:"Gemini",
+    desc:"無料枠あり（キー必要）",
+    requiresKey: true,
+    keyPlaceholder:"AIza...",
+  },
+  gpt: {
+    id:"gpt",
+    label:"GPT-4o",
+    desc:"APIキー必要",
+    requiresKey: true,
+    keyPlaceholder:"sk-...",
+  },
+};
+
+// ── AI CALL ───────────────────────────────────────────────────
+async function callAI(modelId, apiKeys, messages, systemPrompt, maxTokens=1000){
+  if(modelId==="gemini"){
+    const key=apiKeys.gemini;
+    if(!key) throw new Error("Gemini APIキーが設定されていません");
+    const url=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`;
+    const contents=messages.map(m=>({role:m.role==="user"?"user":"model",parts:[{text:m.content}]}));
+    const body={contents};
+    if(systemPrompt) body.system_instruction={parts:[{text:systemPrompt}]};
+    const res=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const data=await res.json();
+    if(data.error) throw new Error(data.error.message);
+    return data.candidates[0].content.parts[0].text;
+  }
+  if(modelId==="gpt"){
+    const key=apiKeys.gpt;
+    if(!key) throw new Error("OpenAI APIキーが設定されていません");
+    const body={model:"gpt-4o",max_tokens:maxTokens,messages:[...(systemPrompt?[{role:"system",content:systemPrompt}]:[]),...messages]};
+    const res=await fetch("https://api.openai.com/v1/chat/completions",{method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${key}`},body:JSON.stringify(body)});
+    const data=await res.json();
+    if(data.error) throw new Error(data.error.message);
+    return data.choices[0].message.content;
+  }
+  if(modelId==="claude"){
+    const headers={"Content-Type":"application/json"};
+    if(!IS_CLAUDE){
+      const key=apiKeys.claude;
+      if(!key) throw new Error("Claude APIキーが設定されていません");
+      headers["x-api-key"]=key;
+      headers["anthropic-version"]="2023-06-01";
+      headers["anthropic-dangerous-direct-browser-access"]="true";
+    }
+    const body={model:"claude-sonnet-4-20250514",max_tokens:maxTokens,messages};
+    if(systemPrompt) body.system=systemPrompt;
+    const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers,body:JSON.stringify(body)});
+    const data=await res.json();
+    if(data.error) throw new Error(data.error.message||JSON.stringify(data.error));
+    return data.content[0].text;
+  }
+  throw new Error("不明なモデル: "+modelId);
+}
+
+// ── STORAGE LAYER ─────────────────────────────────────────────
+// Unified storage: Claude env → window.storage, local → localStorage
+const store = {
+  async get(key){
+    if(IS_CLAUDE){
+      try{ const r=await window.storage.get(key); return r?r.value:null; }catch(e){ return null; }
+    }
+    try{ return localStorage.getItem(key); }catch(e){ return null; }
+  },
+  async set(key,val){
+    if(IS_CLAUDE){
+      try{ await window.storage.set(key,val); return true; }catch(e){ return false; }
+    }
+    try{ localStorage.setItem(key,val); return true; }catch(e){ return false; }
+  },
+  async del(key){
+    if(IS_CLAUDE){
+      try{ await window.storage.delete(key); }catch(e){}
+    } else {
+      try{ localStorage.removeItem(key); }catch(e){}
+    }
+  },
+};
+
+// ── IDB (for FileSystem handle, local only) ───────────────────
+function openIDB(){
+  return new Promise((res,rej)=>{
+    const req=indexedDB.open(IDB_NAME,1);
+    req.onupgradeneeded=e=>e.target.result.createObjectStore(IDB_STORE);
+    req.onsuccess=e=>res(e.target.result);
+    req.onerror=e=>rej(e.target.error);
+  });
+}
+async function idbGet(key){ const db=await openIDB(); return new Promise((res,rej)=>{ const req=db.transaction(IDB_STORE,"readonly").objectStore(IDB_STORE).get(key); req.onsuccess=e=>res(e.target.result); req.onerror=e=>rej(e.target.error); }); }
+async function idbSet(key,val){ const db=await openIDB(); return new Promise((res,rej)=>{ const tx=db.transaction(IDB_STORE,"readwrite"); tx.objectStore(IDB_STORE).put(val,key); tx.oncomplete=()=>res(); tx.onerror=e=>rej(e.target.error); }); }
+async function idbDel(key){ const db=await openIDB(); return new Promise((res,rej)=>{ const tx=db.transaction(IDB_STORE,"readwrite"); tx.objectStore(IDB_STORE).delete(key); tx.oncomplete=()=>res(); tx.onerror=e=>rej(e.target.error); }); }
+
+// ── FILE SYSTEM (local only) ──────────────────────────────────
+const fsSupported=!IS_CLAUDE && typeof window.showDirectoryPicker==="function";
+async function getSavedDirHandle(){ try{ const h=await idbGet(IDB_KEY); if(!h) return null; const p=await h.queryPermission({mode:"readwrite"}); if(p==="granted") return h; return await h.requestPermission({mode:"readwrite"})==="granted"?h:null; }catch(e){ return null; } }
+async function pickDirectory(){ if(!fsSupported) return null; try{ const h=await window.showDirectoryPicker({mode:"readwrite"}); await idbSet(IDB_KEY,h); return h; }catch(e){ return null; } }
+async function readLocalFile(dh){ try{ const fh=await dh.getFileHandle(DATA_FILENAME,{create:true}); const t=await (await fh.getFile()).text(); return t.trim()?JSON.parse(t):[]; }catch(e){ return []; } }
+async function writeLocalFile(dh,sessions){ 
+  try{ 
+    // Write main JSON
+    const fh=await dh.getFileHandle(DATA_FILENAME,{create:true}); 
+    const w=await fh.createWritable(); 
+    await w.write(JSON.stringify(sessions,null,2)); 
+    await w.close(); 
+
+    // Auto-sync Markdown files for each session
+    for(const s of sessions){
+      try{
+        const dateStr=s.date?s.date.slice(0,10):"unknown";
+        const safeTitle=(s.title||"記録").replace(/[/\\?%*:|"<>]/g,"_").slice(0,30);
+        const fname=`${dateStr}_${safeTitle}.md`;
+        const lines=[
+          `# ${s.title||"記録"}`,
+          `**日時**: ${fmtFull(s.date)}`,
+          s.source&&s.source!=="Journal"?`**ソース**: ${s.source}`:"",
+          s.model?`**AI**: ${s.model}`:"",
+          "",
+          s.summary?`## 要約\n${s.summary}`:"",
+          "",
+          s.bias?[
+            "## 思考デバッグ",
+            s.bias.trigger?`**トリガー**: ${s.bias.trigger}`:"",
+            s.bias.raw_reaction?`**野生の反応**: ${s.bias.raw_reaction}`:"",
+            s.bias.value_exposed?`**露わになった価値観**: ${s.bias.value_exposed}`:"",
+            s.bias.bias_pattern?`**思考の癖**: ${s.bias.bias_pattern}`:"",
+            s.bias.debug_question?`**問い**: 「${s.bias.debug_question}」`:"",
+          ].filter(Boolean).join("\n"):"",
+          "",
+          s.insights?.length>0?`## 気づき\n${s.insights.map(i=>`- ${i}`).join("\n")}`:"",
+          "",
+          s.tags?.length>0?`## タグ\n${s.tags.map(t=>`\`#${t}\``).join(" ")}`:"",
+          "",
+          s.messages?.length>0?`## 会話\n${s.messages.map(m=>`**${m.role==="user"?"自分":"AI"}**: ${m.content}`).join("\n\n")}`:"",
+        ].filter(l=>l!=="").join("\n");
+        const mfh=await dh.getFileHandle(fname,{create:true});
+        const mw=await mfh.createWritable();
+        await mw.write(lines);
+        await mw.close();
+      }catch(e){}
+    }
+    return true; 
+  }catch(e){ return false; } 
+}
+
+// ── HELPERS ───────────────────────────────────────────────────
+const fmt=(iso)=>{const d=new Date(iso);return`${d.getMonth()+1}/${d.getDate()}`;};
+const fmtFull=(iso)=>{const d=new Date(iso);return`${d.getFullYear()}年${d.getMonth()+1}月${d.getDate()}日 ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;};
+
+function dlFile(content,filename,type){ const blob=new Blob([content],{type}); const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=filename; a.click(); URL.revokeObjectURL(url); }
+function exportJSON(s){ dlFile(JSON.stringify(s,null,2),`journal_${new Date().toISOString().slice(0,10)}.json`,"application/json"); }
+function exportMarkdown(sessions){
+  const lines=sessions.map(s=>{
+    const h=`# ${s.title}\n**日時**: ${fmtFull(s.date)}${s.source&&s.source!=="Journal"?`  **ソース**: ${s.source}`:""}`;
+    const sum=s.summary?`\n## 要約\n${s.summary}`:"";
+    const ins=s.insights?.length>0?`\n## 気づき\n${s.insights.map(i=>`- ${i}`).join("\n")}`:"";
+    const tags=s.tags?.length>0?`\n## タグ\n${s.tags.map(t=>`\`#${t}\``).join(" ")}`:"";
+    const msgs=s.messages?.length>0?`\n## 会話\n${s.messages.map(m=>`**${m.role==="user"?"自分":"AI"}**: ${m.content}`).join("\n\n")}`:"";
+    return [h,sum,ins,tags,msgs].filter(Boolean).join("\n")+"\n\n---\n";
+  });
+  dlFile(lines.join("\n"),`journal_${new Date().toISOString().slice(0,10)}.md`,"text/markdown");
+}
+function exportText(sessions){
+  const lines=sessions.map(s=>{
+    const h=`【${s.title}】${fmtFull(s.date)}`;
+    const sum=s.summary?`要約: ${s.summary}`:"";
+    const tags=s.tags?.length>0?`タグ: ${s.tags.map(t=>`#${t}`).join(" ")}`:"";
+    const msgs=s.messages?.length>0?s.messages.map(m=>`${m.role==="user"?"自分":"AI"}: ${m.content}`).join("\n"):"";
+    return [h,sum,tags,msgs].filter(Boolean).join("\n")+"\n\n════════════\n";
+  });
+  dlFile(lines.join("\n"),`journal_${new Date().toISOString().slice(0,10)}.txt`,"text/plain");
+}
+function exportSingleMd(session){
+  const h=`# ${session.title}\n**日時**: ${fmtFull(session.date)}`;
+  const sum=session.summary?`\n## 要約\n${session.summary}`:"";
+  const ins=session.insights?.length>0?`\n## 気づき\n${session.insights.map(i=>`- ${i}`).join("\n")}`:"";
+  const tags=session.tags?.length>0?`\n## タグ\n${session.tags.map(t=>`\`#${t}\``).join(" ")}`:"";
+  const msgs=session.messages?.length>0?`\n## 会話\n${session.messages.map(m=>`**${m.role==="user"?"自分":"AI"}**: ${m.content}`).join("\n\n")}`:"";
+  dlFile([h,sum,ins,tags,msgs].filter(Boolean).join("\n"),`${session.title}_${session.date.slice(0,10)}.md`,"text/markdown");
+}
+
+// ── IMPORT PARSE ──────────────────────────────────────────────
+function parseClaudeExport(arr){ return arr.map(conv=>{ const msgs=(conv.chat_messages||[]).map(m=>({role:m.sender==="human"?"user":"assistant",content:typeof m.text==="string"?m.text:(m.content||"")})).filter(m=>m.content); return {sourceId:conv.uuid||`c_${Date.now()}`,title:conv.name||"無題",date:conv.created_at||new Date().toISOString(),messages:msgs,source:"Claude"}; }).filter(c=>c.messages.length>0); }
+function parseGPTExport(arr){ return arr.map(conv=>{ const mapping=conv.mapping||{}; const msgs=Object.values(mapping).filter(n=>n.message&&n.message.content&&n.message.author).sort((a,b)=>(a.message.create_time||0)-(b.message.create_time||0)).map(n=>{ const role=n.message.author.role; const parts=n.message.content.parts||[]; const text=parts.filter(p=>typeof p==="string").join("\n").trim(); return text?{role:role==="user"?"user":"assistant",content:text}:null; }).filter(Boolean); const date=conv.create_time?new Date(conv.create_time*1000).toISOString():new Date().toISOString(); return {sourceId:conv.id||`g_${Date.now()}`,title:conv.title||"無題",date,messages:msgs,source:"ChatGPT"}; }).filter(c=>c.messages.length>0); }
+
+function parseGeminiHTML(htmlText){
+  // Parse Gemini "マイアクティビティ" HTML format
+  const blocks = htmlText.split('class="outer-cell').slice(1);
+  const parsed = [];
+  for(const b of blocks){
+    const userMatch = b.match(/送信したメッセージ:\s*(.+?)<br>/);
+    const userMsg = userMatch ? userMatch[1].replace(/<[^>]+>/g,'').trim() : "";
+    const dateMatch = b.match(/(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) JST/);
+    const dateStr = dateMatch ? dateMatch[1] : "";
+    // Extract Gemini response text after the date
+    const respMatch = b.match(/JST<br>([\s\S]*?)<\/div>\s*<\/div>\s*<div class="content-cell[^"]*mdl-typography--caption/);
+    let geminiResp = "";
+    if(respMatch){
+      geminiResp = respMatch[1].replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+    }
+    if(userMsg && dateStr){
+      parsed.push({user:userMsg, gemini:geminiResp, date:dateStr});
+    }
+  }
+  if(parsed.length === 0) return [];
+
+  // Group into conversations by 30-minute proximity
+  const THRESHOLD = 30 * 60 * 1000;
+  function toDate(s){ const [date,time]=s.split(' '); const [y,mo,d]=date.split('/'); const [h,mi,sec]=time.split(':'); return new Date(y,mo-1,d,h,mi,sec); }
+
+  const conversations = [];
+  let current = [];
+  for(const entry of parsed){
+    if(!current.length){ current.push(entry); continue; }
+    const prevD = toDate(current[current.length-1].date);
+    const currD = toDate(entry.date);
+    if(Math.abs(currD - prevD) <= THRESHOLD){ current.push(entry); }
+    else{ conversations.push(current); current=[entry]; }
+  }
+  if(current.length) conversations.push(current);
+
+  return conversations.map((conv,i)=>{
+    const first = conv[0];
+    const title = first.user.slice(0,30) || `Gemini会話 ${i+1}`;
+    const messages = [];
+    for(const e of conv){
+      if(e.user) messages.push({role:"user", content:e.user});
+      if(e.gemini) messages.push({role:"assistant", content:e.gemini});
+    }
+    let isoDate = new Date().toISOString();
+    try{
+      const [date,time]=first.date.split(' ');
+      const [y,mo,d]=date.split('/');
+      const [h,mi,s]=time.split(':');
+      isoDate = new Date(y,mo-1,d,h,mi,s).toISOString();
+    }catch(e){}
+    const sourceId = `gemini_${i}_${first.date.replace(/[\/: ]/g,'')}`;
+    return {sourceId, title, date:isoDate, messages, source:"Gemini"};
+  }).filter(c=>c.messages.length>0);
+}
+
+function detectAndParse(json){ const arr=Array.isArray(json)?json:[]; if(!arr.length) return []; if(arr[0].chat_messages!==undefined) return parseClaudeExport(arr); if(arr[0].mapping!==undefined) return parseGPTExport(arr); return []; }
+
+// ── UI ATOMS ─────────────────────────────────────────────────
+function Toast({msg,type}){ if(!msg) return null; const col=type==="ok"?C.ok:type==="err"?C.err:C.accent; return <div style={{position:"fixed",top:64,left:"50%",transform:"translateX(-50%)",zIndex:300,backgroundColor:type==="err"?C.errBg:C.accentBg,border:`1px solid ${col}`,borderRadius:10,padding:"10px 18px",fontSize:12,color:col,pointerEvents:"none",maxWidth:"90vw",textAlign:"center"}}>{msg}</div>; }
+function Dots(){ return <span style={{display:"inline-flex",gap:4}}>{[0,1,2].map(i=><span key={i} style={{width:6,height:6,borderRadius:"50%",backgroundColor:C.textSec,animation:"pulse 1.2s ease-in-out infinite",animationDelay:`${i*0.2}s`,display:"inline-block"}}/>)}</span>; }
+function Spinner(){ return <div style={{width:18,height:18,border:`2px solid ${C.border}`,borderTop:`2px solid ${C.accent}`,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/>; }
+function Bubble({msg}){ const u=msg.role==="user"; return <div style={{display:"flex",justifyContent:u?"flex-end":"flex-start",marginBottom:10,padding:"0 16px"}}><div style={{maxWidth:"78%",padding:"10px 14px",fontSize:14,lineHeight:1.65,borderRadius:u?"18px 18px 4px 18px":"18px 18px 18px 4px",backgroundColor:u?C.accent:C.surface,color:u?"#fff":C.text,fontWeight:u?500:400,border:u?"none":`1px solid ${C.border}`}}>{msg.content.split("\n").map((l,i,a)=><span key={i}>{l}{i<a.length-1&&<br/>}</span>)}</div></div>; }
+
+// ── ENV BANNER ────────────────────────────────────────────────
+function EnvBanner(){
+  if(IS_CLAUDE){
+    return(
+      <div style={{backgroundColor:C.infoBg,border:`1px solid ${C.info}`,borderRadius:8,padding:"8px 12px",margin:"12px 16px 0",fontSize:11,color:C.info,lineHeight:1.7}}>
+        📌 <b>Claude内で動作中</b> — データはClaudeアプリ内に保存されています。<br/>
+        ローカル版へ移行する場合は「書き出し」→ JSON形式 → ローカル版で「取り込み」してください。
+      </div>
+    );
+  }
+  return(
+    <div style={{backgroundColor:C.okBg,border:`1px solid ${C.ok}`,borderRadius:8,padding:"8px 12px",margin:"12px 16px 0",fontSize:11,color:C.ok,lineHeight:1.7}}>
+      📁 <b>ローカルで動作中</b> — データはPCのフォルダ（journal-data.json）に保存されています。<br/>
+      Claude内版とデータを共有するには「書き出し」→ JSON → Claude版で「取り込み」してください。
+    </div>
+  );
+}
+
+// ── SETUP: STORAGE (local only) ───────────────────────────────
+function StorageSetup({onComplete}){
+  const [picking,setPicking]=useState(false);
+  async function chooseLocal(){ setPicking(true); const h=await pickDirectory(); setPicking(false); if(h) onComplete("local",h); }
+  return(
+    <div style={{minHeight:"100vh",backgroundColor:C.bg,display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
+      <div style={{width:"100%",maxWidth:440}}>
+        <div style={{textAlign:"center",marginBottom:28}}>
+          <div style={{fontSize:28,color:C.accent,marginBottom:10}}>✦</div>
+          <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:6}}>Journal — 初回設定</div>
+          <div style={{fontSize:13,color:C.textSec,lineHeight:1.8}}>データの保存場所を選んでください</div>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          {fsSupported&&(
+            <div onClick={chooseLocal} style={{backgroundColor:C.card,borderRadius:14,padding:"20px",border:`2px solid ${C.accent}`,cursor:picking?"default":"pointer",opacity:picking?0.7:1}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                <span style={{fontSize:22}}>📁</span>
+                <div style={{fontSize:15,fontWeight:700,color:C.accent}}>ローカルフォルダに保存 <span style={{fontSize:11,color:C.accentDim}}>推奨</span></div>
+              </div>
+              <div style={{fontSize:12,color:C.textSec,lineHeight:1.8,marginBottom:8}}>PCのフォルダに <b style={{color:C.text}}>journal-data.json</b> として保存します。<br/>ブラウザを変えても消えません。</div>
+              <div style={{backgroundColor:C.accentBg,borderRadius:8,padding:"8px 12px",fontSize:11,color:C.accentDim,lineHeight:1.7}}>💡 次の画面で <b style={{color:C.accent}}>journal-appフォルダ</b> を選ぶと一緒に管理できます</div>
+              {picking&&<div style={{display:"flex",justifyContent:"center",marginTop:12}}><Spinner/></div>}
+            </div>
+          )}
+          <div onClick={()=>onComplete("browser",null)} style={{backgroundColor:C.card,borderRadius:14,padding:"20px",border:`1px solid ${C.border}`,cursor:"pointer"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}><span style={{fontSize:22}}>🌐</span><div style={{fontSize:15,fontWeight:700,color:C.text}}>ブラウザ内に保存</div></div>
+            <div style={{fontSize:12,color:C.textSec,lineHeight:1.7}}>ブラウザのlocalStorageに保存します。手軽ですがデータ削除で消える可能性があります。</div>
+          </div>
+        </div>
+        {!fsSupported&&<div style={{marginTop:12,fontSize:11,color:C.textDim,textAlign:"center"}}>ローカル保存にはChrome/Edgeが必要です</div>}
+      </div>
+    </div>
+  );
+}
+
+// ── SETUP: MODEL + API KEY ────────────────────────────────────
+function ModelSetup({onSave, isClaude}){
+  const [selectedModel,setSelectedModel]=useState(isClaude?"claude":"gemini");
+  const [keys,setKeys]=useState({claude:"",gemini:"",gpt:""});
+  const [visible,setVisible]=useState({});
+
+  const model=MODELS[selectedModel];
+  const needsKey=model.requiresKey;
+  const currentKey=keys[selectedModel];
+  const canProceed=!needsKey||currentKey.trim().length>0;
+
+  function save(){
+    if(!canProceed) return;
+    onSave(selectedModel, keys);
+  }
+
+  return(
+    <div style={{minHeight:"100vh",backgroundColor:C.bg,display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
+      <div style={{width:"100%",maxWidth:420}}>
+        <div style={{textAlign:"center",marginBottom:24}}>
+          <div style={{fontSize:28,color:C.accent,marginBottom:10}}>✦</div>
+          <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:6}}>AIモデルを選択</div>
+          {isClaude&&<div style={{fontSize:12,color:C.info,backgroundColor:C.infoBg,border:`1px solid ${C.info}`,borderRadius:8,padding:"8px 12px",marginTop:8}}>Claude内で動作中 — Claudeはキー不要で使えます</div>}
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>
+          {Object.values(MODELS).map(m=>(
+            <div key={m.id} onClick={()=>setSelectedModel(m.id)}
+              style={{backgroundColor:selectedModel===m.id?C.accentBg:C.card,borderRadius:12,padding:"14px 16px",border:`1px solid ${selectedModel===m.id?C.accent:C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontSize:14,fontWeight:600,color:selectedModel===m.id?C.accent:C.text}}>{m.label}</div>
+                <div style={{fontSize:11,color:C.textDim,marginTop:2}}>{m.desc}</div>
+              </div>
+              {selectedModel===m.id&&<div style={{width:8,height:8,borderRadius:"50%",backgroundColor:C.accent}}/>}
+            </div>
+          ))}
+        </div>
+
+        {needsKey&&(
+          <div style={{backgroundColor:C.card,borderRadius:12,padding:16,border:`1px solid ${C.border}`,marginBottom:16}}>
+            <div style={{fontSize:11,color:C.textSec,marginBottom:8}}>
+              {selectedModel==="gemini"&&<><a href="https://aistudio.google.com/app/apikey" target="_blank" style={{color:C.accentDim}}>aistudio.google.com</a> で無料取得</>}
+              {selectedModel==="gpt"&&<><a href="https://platform.openai.com/api-keys" target="_blank" style={{color:C.accentDim}}>platform.openai.com</a> で取得</>}
+              {selectedModel==="claude"&&<><a href="https://console.anthropic.com/settings/keys" target="_blank" style={{color:C.accentDim}}>console.anthropic.com</a> で取得</>}
+            </div>
+            <div style={{position:"relative"}}>
+              <input type={visible[selectedModel]?"text":"password"} value={keys[selectedModel]} onChange={e=>setKeys({...keys,[selectedModel]:e.target.value})} placeholder={model.keyPlaceholder}
+                style={{width:"100%",backgroundColor:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 40px 9px 12px",color:C.text,fontSize:13,outline:"none",fontFamily:"monospace",boxSizing:"border-box"}}/>
+              <button onClick={()=>setVisible({...visible,[selectedModel]:!visible[selectedModel]})} style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",backgroundColor:"transparent",border:"none",color:C.textDim,cursor:"pointer"}}>{visible[selectedModel]?"🙈":"👁"}</button>
+            </div>
+          </div>
+        )}
+
+        <button onClick={save} disabled={!canProceed}
+          style={{width:"100%",padding:"11px",borderRadius:10,backgroundColor:canProceed?C.accentDim:"#2a2720",border:`1px solid ${canProceed?C.accent:C.border}`,color:canProceed?C.accent:C.textDim,fontSize:13,cursor:canProceed?"pointer":"default",fontWeight:500}}>
+          始める
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── FOLDER REPICK ─────────────────────────────────────────────
+function FolderRepick({onPicked,onSwitchToBrowser}){
+  const [picking,setPicking]=useState(false);
+  async function pick(){ setPicking(true); const h=await pickDirectory(); setPicking(false); if(h) onPicked(h); }
+  return(
+    <div style={{minHeight:"100vh",backgroundColor:C.bg,display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
+      <div style={{width:"100%",maxWidth:400,textAlign:"center"}}>
+        <div style={{fontSize:36,marginBottom:14}}>📁</div>
+        <div style={{fontSize:16,fontWeight:700,color:C.text,marginBottom:8}}>フォルダへのアクセスを許可</div>
+        <div style={{fontSize:13,color:C.textSec,lineHeight:1.8,marginBottom:6}}>Chromeのセキュリティ上、起動のたびに<br/>フォルダへのアクセス確認が必要です。</div>
+        <div style={{backgroundColor:C.accentBg,border:`1px solid ${C.accentDim}`,borderRadius:10,padding:"10px 14px",fontSize:12,color:C.accentDim,lineHeight:1.7,marginBottom:24}}>前回と<b style={{color:C.accent}}>同じフォルダ</b>を選択してください</div>
+        <button onClick={pick} disabled={picking} style={{width:"100%",padding:"12px",borderRadius:10,backgroundColor:C.accentDim,border:`1px solid ${C.accent}`,color:C.accent,fontSize:14,cursor:picking?"default":"pointer",fontWeight:500,marginBottom:10}}>
+          {picking?"選択中...":"フォルダを選択"}
+        </button>
+        <button onClick={onSwitchToBrowser} style={{width:"100%",padding:"10px",borderRadius:10,backgroundColor:"transparent",border:`1px solid ${C.border}`,color:C.textSec,fontSize:12,cursor:"pointer"}}>ブラウザ保存に切り替える</button>
+      </div>
+    </div>
+  );
+}
+
+// ── SETTINGS VIEW ─────────────────────────────────────────────
+function SettingsView({modelId,apiKeys,saveMode,dirHandle,onUpdateModel,onChangeFolder,onSwitchMode,onClose,showToast}){
+  const [selModel,setSelModel]=useState(modelId);
+  const [keys,setKeys]=useState({...apiKeys});
+  const [visible,setVisible]=useState({});
+  const [picking,setPicking]=useState(false);
+
+  async function saveModel(){
+    onUpdateModel(selModel,keys);
+    showToast("設定を更新しました","ok");
+  }
+  async function changeFolder(){ setPicking(true); const h=await pickDirectory(); setPicking(false); if(h){ onChangeFolder(h); showToast("フォルダを変更しました","ok"); } }
+  async function switchToLocal(){ const h=await pickDirectory(); if(!h) return; onSwitchMode("local",h); showToast("ローカル保存に切り替えました","ok"); }
+  async function switchToBrowser(){ await idbDel(IDB_KEY); onSwitchMode("browser",null); showToast("ブラウザ保存に切り替えました","ok"); }
+
+  const Section=({title,children})=>(
+    <div style={{backgroundColor:C.card,borderRadius:12,padding:"16px",border:`1px solid ${C.border}`,marginBottom:12}}>
+      <div style={{fontSize:10,color:C.accent,letterSpacing:"0.12em",marginBottom:12}}>{title}</div>
+      {children}
+    </div>
+  );
+
+  return(
+    <div style={{padding:"16px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+        <div style={{fontSize:15,fontWeight:700,color:C.text}}>設定</div>
+        <button onClick={onClose} style={{backgroundColor:"transparent",border:"none",color:C.textSec,cursor:"pointer",fontSize:13}}>✕ 閉じる</button>
+      </div>
+
+      {/* ENV INFO */}
+      <Section title="動作環境">
+        <div style={{fontSize:12,color:C.textSec,lineHeight:1.8}}>
+          {IS_CLAUDE?(
+            <><span style={{color:C.info}}>● Claude内で動作中</span><br/>データ保存先: Claudeアプリ内ストレージ<br/>容量上限: 5MB（通常の日記なら数年分に相当）<br/><span style={{color:C.textDim,fontSize:11}}>ローカル版へのデータ移行は「書き出し → JSON → ローカル版で取り込み」</span></>
+          ):(
+            <><span style={{color:C.ok}}>● ローカルで動作中</span><br/>データ保存先: {saveMode==="local"?`📁 ${dirHandle?.name||"選択済みフォルダ"}/journal-data.json`:"🌐 ブラウザlocalStorage"}<br/><span style={{color:C.textDim,fontSize:11}}>Claude内版とのデータ移行は「書き出し → JSON → Claude版で取り込み」</span></>
+          )}
+        </div>
+      </Section>
+
+      {/* MODEL */}
+      <Section title="AIモデル">
+        <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>
+          {Object.values(MODELS).map(m=>(
+            <div key={m.id} onClick={()=>setSelModel(m.id)}
+              style={{padding:"10px 12px",borderRadius:10,border:`1px solid ${selModel===m.id?C.accent:C.border}`,backgroundColor:selModel===m.id?C.accentBg:"transparent",cursor:"pointer",display:"flex",justifyContent:"space-between"}}>
+              <div>
+                <span style={{fontSize:13,fontWeight:600,color:selModel===m.id?C.accent:C.text}}>{m.label}</span>
+                <span style={{fontSize:11,color:C.textDim,marginLeft:8}}>{m.desc}</span>
+              </div>
+              {selModel===m.id&&<div style={{width:7,height:7,borderRadius:"50%",backgroundColor:C.accent,marginTop:4}}/>}
+            </div>
+          ))}
+        </div>
+        {MODELS[selModel].requiresKey&&(
+          <div style={{position:"relative",marginBottom:10}}>
+            <input type={visible[selModel]?"text":"password"} value={keys[selModel]||""} onChange={e=>setKeys({...keys,[selModel]:e.target.value})} placeholder={MODELS[selModel].keyPlaceholder}
+              style={{width:"100%",backgroundColor:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 40px 9px 12px",color:C.text,fontSize:13,outline:"none",fontFamily:"monospace",boxSizing:"border-box"}}/>
+            <button onClick={()=>setVisible({...visible,[selModel]:!visible[selModel]})} style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",backgroundColor:"transparent",border:"none",color:C.textDim,cursor:"pointer"}}>{visible[selModel]?"🙈":"👁"}</button>
+          </div>
+        )}
+        <button onClick={saveModel} style={{width:"100%",padding:"9px",borderRadius:8,backgroundColor:C.accentDim,border:`1px solid ${C.accent}`,color:C.accent,fontSize:12,cursor:"pointer"}}>モデル設定を保存</button>
+      </Section>
+
+      {/* SAVE MODE (local only) */}
+      {!IS_CLAUDE&&(
+        <Section title="保存モード">
+          <div style={{fontSize:12,color:C.textSec,marginBottom:12}}>
+            現在: <b style={{color:C.text}}>{saveMode==="local"?"📁 ローカルフォルダ":"🌐 ブラウザ内"}</b>
+            {saveMode==="local"&&dirHandle&&<div style={{fontSize:11,color:C.textDim,marginTop:2}}>フォルダ: {dirHandle.name}</div>}
+          </div>
+          {saveMode==="local"?(
+            <><button onClick={changeFolder} disabled={picking} style={{width:"100%",padding:"9px",borderRadius:8,backgroundColor:"transparent",border:`1px solid ${C.border}`,color:C.textSec,fontSize:12,cursor:"pointer",marginBottom:8}}>{picking?"選択中...":"📁 フォルダを変更"}</button>
+            <button onClick={switchToBrowser} style={{width:"100%",padding:"9px",borderRadius:8,backgroundColor:"transparent",border:`1px solid ${C.border}`,color:C.textSec,fontSize:12,cursor:"pointer"}}>🌐 ブラウザ保存に切り替え</button></>
+          ):fsSupported&&(
+            <button onClick={switchToLocal} style={{width:"100%",padding:"9px",borderRadius:8,backgroundColor:C.accentDim,border:`1px solid ${C.accent}`,color:C.accent,fontSize:12,cursor:"pointer"}}>📁 ローカル保存に切り替え</button>
+          )}
+        </Section>
+      )}
+
+      {/* SECURITY NOTE */}
+      <Section title="セキュリティ">
+        <div style={{fontSize:11,color:C.textDim,lineHeight:1.8}}>
+          ⚠ APIキーはこのブラウザ内に保存されます。<br/>
+          共有PC・会社PCでは使用しないでください。<br/>
+          万が一の際はAPI管理画面でキーを削除・再発行してください。<br/>
+          仕事の機密情報・個人情報は入力しないでください。
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+// ── SAVE CARD ─────────────────────────────────────────────────
+function SaveCard({meta,onViewLogs}){
+  return(
+    <div style={{margin:"12px 16px",backgroundColor:C.accentBg,border:`1px solid ${C.accentDim}`,borderRadius:12,padding:"14px 16px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}><span style={{color:C.ok}}>✓</span><span style={{color:C.accent,fontSize:12}}>保存完了 — 自動解析済み</span></div>
+      <div style={{fontSize:15,fontWeight:700,color:C.text,marginBottom:5}}>{meta.title}</div>
+      {meta.summary&&<div style={{fontSize:12,color:C.textSec,lineHeight:1.7,marginBottom:8}}>{meta.summary}</div>}
+      {meta.insights?.length>0&&<div style={{marginBottom:8}}>{meta.insights.map((ins,i)=><div key={i} style={{display:"flex",gap:6,fontSize:12,color:C.text,lineHeight:1.6,marginBottom:3}}><span style={{color:C.accentDim}}>✦</span><span>{ins}</span></div>)}</div>}
+      {meta.tags?.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>{meta.tags.map(t=><span key={t} style={{fontSize:11,padding:"2px 9px",borderRadius:10,backgroundColor:C.card,color:C.textSec,border:`1px solid ${C.border}`}}>#{t}</span>)}</div>}
+      <button onClick={onViewLogs} style={{width:"100%",padding:"8px",borderRadius:8,backgroundColor:C.accentDim,border:"none",color:C.accent,fontSize:12,cursor:"pointer"}}>ログ・カレンダーで確認 →</button>
+    </div>
+  );
+}
+
+// ── CHAT VIEW ─────────────────────────────────────────────────
+// ── ROUTINE CHIPS ────────────────────────────────────────────
+const ROUTINE_SECTIONS = [
+  {
+    id:"night", icon:"🌙", label:"前日夜の行動",
+    chips:["早めに寝た","夜更かし","スマホ長時間","お酒飲んだ","運動した","ゆっくりした"],
+  },
+  {
+    id:"morning", icon:"🌅", label:"朝の状態",
+    chips:["すっきり","だるい","眠い","頭が重い","体が軽い","やる気ある"],
+  },
+  {
+    id:"performance", icon:"⚡", label:"今日の状態・パフォーマンス",
+    chips:["集中できた","だるかった","調子よかった","波があった","イマイチ","絶好調"],
+  },
+];
+
+// 感情アラートチップ（野性センサー）
+const ALERT_CHIPS = [
+  {emoji:"😤", label:"イライラした"},
+  {emoji:"🌀", label:"モヤモヤした"},
+  {emoji:"😶", label:"違和感があった"},
+  {emoji:"🤔", label:"なんか引っかかる"},
+  {emoji:"😔", label:"落ち込んだ"},
+  {emoji:"😤", label:"理不尽を感じた"},
+];
+
+function RoutinePanel({onSend, isLoading}){
+  const [selected, setSelected]=useState({night:new Set(), morning:new Set(), performance:new Set()});
+  const [alerts, setAlerts]=useState(new Set());
+  const [freeText, setFreeText]=useState("");
+  const [alertText, setAlertText]=useState("");
+  const [showAlertInput, setShowAlertInput]=useState(false);
+
+  function toggleChip(sectionId, chip){
+    setSelected(prev=>{
+      const next={...prev};
+      const s=new Set(prev[sectionId]);
+      s.has(chip)?s.delete(chip):s.add(chip);
+      next[sectionId]=s;
+      return next;
+    });
+  }
+
+  function toggleAlert(label){
+    const next=new Set(alerts);
+    if(next.has(label)){ next.delete(label); } else { next.add(label); setShowAlertInput(true); }
+    setAlerts(next);
+    if(next.size===0) setShowAlertInput(false);
+  }
+
+  function buildMessage(){
+    const parts=ROUTINE_SECTIONS.map(sec=>{
+      const chips=[...selected[sec.id]];
+      if(chips.length===0) return null;
+      return `${sec.icon} ${sec.label}: ${chips.join("・")}`;
+    }).filter(Boolean);
+    if(alerts.size>0){
+      const alertPart=`⚠️ 感情アラート: ${[...alerts].join("・")}`;
+      parts.push(alertPart);
+    }
+    if(alertText.trim()) parts.push(`→ ${alertText.trim()}`);
+    if(freeText.trim()) parts.push(freeText.trim());
+    return parts.join("\n");
+  }
+
+  const hasAnyInput=[...Object.values(selected)].some(s=>s.size>0)||freeText.trim().length>0||alerts.size>0;
+
+  // Preview of what will be sent
+  const preview = buildMessage();
+
+  return(
+    <div style={{borderTop:`1px solid ${C.border}`,backgroundColor:C.surface}}>
+      <div style={{padding:"12px 12px 0"}}>
+        {/* Routine chips */}
+        {ROUTINE_SECTIONS.map(sec=>(
+          <div key={sec.id} style={{marginBottom:10}}>
+            <div style={{fontSize:11,color:C.textSec,marginBottom:6}}>{sec.icon} {sec.label}</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {sec.chips.map(chip=>{
+                const active=selected[sec.id].has(chip);
+                return(
+                  <button key={chip} onClick={()=>toggleChip(sec.id,chip)}
+                    style={{padding:"5px 11px",borderRadius:16,fontSize:12,cursor:"pointer",transition:"all 0.15s",
+                      backgroundColor:active?C.accent:"transparent",
+                      color:active?"#1a1200":C.textSec,
+                      border:`1px solid ${active?C.accent:C.border}`,
+                      fontWeight:active?600:400,
+                    }}>
+                    {chip}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+
+        {/* Alert sensor */}
+        <div style={{marginBottom:10,paddingTop:4,borderTop:`1px dashed ${C.border}`}}>
+          <div style={{fontSize:11,color:C.err,marginBottom:6,opacity:0.8}}>⚠️ 感情アラート <span style={{color:C.textDim,fontSize:10}}>— 今日引っかかったことがあれば</span></div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+            {ALERT_CHIPS.map(({emoji,label})=>{
+              const active=alerts.has(label);
+              return(
+                <button key={label} onClick={()=>toggleAlert(label)}
+                  style={{padding:"5px 11px",borderRadius:16,fontSize:12,cursor:"pointer",transition:"all 0.15s",
+                    backgroundColor:active?C.errBg:"transparent",
+                    color:active?C.err:C.textDim,
+                    border:`1px solid ${active?C.err:C.border}`,
+                    fontWeight:active?600:400,
+                  }}>
+                  {emoji} {label}
+                </button>
+              );
+            })}
+          </div>
+          {showAlertInput&&(
+            <textarea value={alertText} onChange={e=>setAlertText(e.target.value)}
+              placeholder="何があった？誰に？どんな状況で？（正直に、綺麗にしなくていい）"
+              rows={2}
+              style={{width:"100%",marginTop:8,backgroundColor:C.errBg,border:`1px solid ${C.err}`,borderRadius:12,padding:"10px 14px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"'Noto Sans JP',sans-serif",lineHeight:1.6,boxSizing:"border-box",opacity:0.9}}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* Preview of selected chips */}
+      {preview&&(
+        <div style={{margin:"0 12px 6px",backgroundColor:C.accentBg,border:`1px solid ${C.accentDim}33`,borderRadius:10,padding:"8px 12px",fontSize:11,color:C.textSec,lineHeight:1.8,whiteSpace:"pre-wrap"}}>
+          <span style={{color:C.accentDim,fontSize:10,letterSpacing:"0.08em"}}>送信プレビュー</span>
+          <div style={{marginTop:3,color:C.text,fontSize:12}}>{preview}</div>
+        </div>
+      )}
+
+      {/* Free text + send */}
+      <div style={{padding:"8px 12px 10px",display:"flex",gap:8,alignItems:"flex-end"}}>
+        <textarea value={freeText} onChange={e=>setFreeText(e.target.value)}
+          onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey&&hasAnyInput){e.preventDefault();onSend(buildMessage());}}}
+          placeholder="自由に追記してから送信..."
+          rows={1}
+          style={{flex:1,height:40,backgroundColor:C.card,border:`1px solid ${C.border}`,borderRadius:24,padding:"10px 16px",color:C.text,fontSize:14,outline:"none",resize:"none",fontFamily:"'Noto Sans JP',sans-serif",lineHeight:1.5}}
+          onInput={e=>{e.target.style.height="40px";e.target.style.height=Math.min(e.target.scrollHeight,100)+"px";}}
+        />
+        <button onClick={()=>onSend(buildMessage())} disabled={!hasAnyInput||isLoading}
+          style={{width:40,height:40,borderRadius:"50%",flexShrink:0,border:"none",
+            cursor:!hasAnyInput||isLoading?"default":"pointer",
+            backgroundColor:!hasAnyInput||isLoading?C.textDim:C.accent,
+            display:"flex",alignItems:"center",justifyContent:"center"}}>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M22 2L11 13" stroke="#1a1200" strokeWidth="2.5" strokeLinecap="round"/><path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="#1a1200" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ChatView({modelId,apiKeys,messages,setMessages,savedMeta,setSavedMeta,sessionId,onNewChat,persist,onGoToLogs,showToast,sessions}){
+  const [input,setInput]=useState("");
+  const [isLoading,setIsLoading]=useState(false);
+  const [isSaving,setIsSaving]=useState(false);
+  const endRef=useRef(null);
+  const taRef=useRef(null);
+  useEffect(()=>{endRef.current?.scrollIntoView({behavior:"smooth"});},[messages,isLoading,savedMeta]);
+
+  // First message is shown as routine panel; after that normal chat
+  const isFirstMessage=messages.length===0;
+
+  async function sendMessage(text){
+    const t=text.trim(); if(!t||isLoading) return;
+    const next=[...messages,{role:"user",content:t}];
+    setMessages(next); setInput(""); setIsLoading(true);
+    if(taRef.current) taRef.current.style.height="40px";
+    try{ const r=await callAI(modelId,apiKeys,next,SYSTEM_PROMPT); setMessages([...next,{role:"assistant",content:r}]); }
+    catch(e){ showToast("エラー: "+e.message,"err"); }
+    finally{ setIsLoading(false); }
+  }
+
+  async function save(){
+    if(messages.length<2||isSaving||savedMeta) return;
+    setIsSaving(true); showToast("解析中...","info");
+    try{
+      const conv=messages.map(m=>`${m.role==="user"?"自分":"AI"}: ${m.content}`).join("\n\n");
+      const raw=await callAI(modelId,apiKeys,[{role:"user",content:`${EXTRACT_PROMPT}\n\n---\n${conv}`}],null,500);
+      let meta={title:"記録",summary:"",tags:[],insights:[]};
+      try{ meta=JSON.parse(raw.replace(/```json|```/g,"").trim()); }catch(e){}
+      // 2段階: 感情コンテンツがあればバイアス分析も実行
+      let bias=null;
+      if(hasEmotionalContent(messages)){
+        try{
+          const rawBias=await callAI(modelId,apiKeys,[{role:"user",content:`${BIAS_PROMPT}\n\n---\n${conv}`}],null,500);
+          const parsed=JSON.parse(rawBias.replace(/```json|```/g,"").trim());
+          if(parsed && parsed.trigger) bias=parsed;
+        }catch(e){}
+      }
+      const session={id:sessionId,date:new Date().toISOString(),title:meta.title||"記録",summary:meta.summary||"",tags:meta.tags||[],insights:meta.insights||[],bias,messageCount:messages.length,messages,source:"Journal",model:modelId};
+      const updated=[session,...sessions.filter(s=>s.id!==sessionId)];
+      await persist(updated); setSavedMeta(meta);
+      showToast("✓ 保存しました","ok");
+    }catch(e){ showToast("保存エラー: "+e.message,"err"); }
+    finally{ setIsSaving(false); }
+  }
+
+  const modelLabel=MODELS[modelId]?.label||modelId;
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 116px)"}}>
+      <div style={{flex:1,overflowY:"auto",padding:"16px 0"}}>
+        <EnvBanner/>
+        {messages.length===0&&(
+          <div style={{padding:"24px 24px 12px",textAlign:"center"}}>
+            <div style={{fontSize:26,marginBottom:8,color:C.accent}}>✦</div>
+            <div style={{color:C.textSec,fontSize:13,lineHeight:1.8}}>チップを選んで今日を振り返りましょう<br/><span style={{fontSize:11,color:C.textDim}}>使用AI: {modelLabel}</span></div>
+          </div>
+        )}
+        {messages.map((m,i)=><Bubble key={i} msg={m}/>)}
+        {isLoading&&<div style={{display:"flex",justifyContent:"flex-start",padding:"0 16px",marginBottom:10}}><div style={{padding:"10px 14px",borderRadius:"18px 18px 18px 4px",backgroundColor:C.card}}><Dots/></div></div>}
+        {savedMeta&&(
+          <>
+            <SaveCard meta={savedMeta} onViewLogs={onGoToLogs}/>
+            <div style={{padding:"0 16px 12px",display:"flex",justifyContent:"center"}}>
+              <button onClick={onNewChat} style={{padding:"8px 24px",borderRadius:20,backgroundColor:"transparent",border:`1px solid ${C.border}`,color:C.textSec,fontSize:12,cursor:"pointer",letterSpacing:"0.05em"}}>+ 新しい記録を始める</button>
+            </div>
+          </>
+        )}
+        <div ref={endRef}/>
+      </div>
+
+      {/* Input area: routine panel for first message, normal chat after */}
+      {!savedMeta&&(
+        isFirstMessage ? (
+          <RoutinePanel onSend={sendMessage} isLoading={isLoading}/>
+        ) : (
+          <div style={{padding:"10px 12px",borderTop:`1px solid ${C.border}`,backgroundColor:C.surface,display:"flex",flexDirection:"column",gap:8}}>
+            {messages.length>=2&&(
+              <div style={{display:"flex",justifyContent:"flex-end"}}>
+                <button onClick={save} disabled={isSaving} style={{padding:"6px 14px",borderRadius:20,fontSize:12,cursor:isSaving?"default":"pointer",backgroundColor:isSaving?C.textDim:C.accentDim,border:`1px solid ${isSaving?C.border:C.accent}`,color:isSaving?C.bg:C.accent,fontWeight:500}}>
+                  {isSaving?"解析中...":"保存する"}
+                </button>
+              </div>
+            )}
+            <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+              <textarea ref={taRef} value={input}
+                onChange={e=>{setInput(e.target.value);e.target.style.height="40px";e.target.style.height=Math.min(e.target.scrollHeight,120)+"px";}}
+                onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage(input);}}}
+                placeholder={`メッセージを入力... (Enter で送信) — ${modelLabel}`} rows={1}
+                style={{flex:1,height:40,backgroundColor:C.card,border:`1px solid ${C.border}`,borderRadius:24,padding:"10px 16px",color:C.text,fontSize:14,outline:"none",resize:"none",fontFamily:"'Noto Sans JP',sans-serif",lineHeight:1.5}}/>
+              <button onClick={()=>sendMessage(input)} disabled={!input.trim()||isLoading} style={{width:40,height:40,borderRadius:"50%",flexShrink:0,border:"none",cursor:!input.trim()||isLoading?"default":"pointer",backgroundColor:!input.trim()||isLoading?C.textDim:C.accent,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M22 2L11 13" stroke="#1a1200" strokeWidth="2.5" strokeLinecap="round"/><path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="#1a1200" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              </button>
+            </div>
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+// ── WEEKLY REVIEW VIEW ───────────────────────────────────────
+function WeeklyReviewView({modelId, apiKeys, sessions, persist, showToast}){
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [review, setReview] = useState(null);
+  const [savedId, setSavedId] = useState(null);
+  const [range, setRange] = useState(7); // 7 or 30 days
+
+  function getTargetSessions(days){
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    return sessions.filter(s => new Date(s.date) >= cutoff).sort((a,b)=>new Date(a.date)-new Date(b.date));
+  }
+
+  async function generate(){
+    const targets = getTargetSessions(range);
+    if(targets.length === 0){ showToast("対象期間に記録がありません", "err"); return; }
+    setIsGenerating(true); setReview(null); setSavedId(null);
+    showToast("AIが分析中...", "info");
+    try{
+      const logs = targets.map(s => {
+        const d = fmtFull(s.date);
+        const body = s.messages?.filter(m=>m.role==="user").map(m=>m.content).join(" / ") || s.summary || "";
+        return `【${d}】${s.title}\n${body}`;
+      }).join("\n\n");
+
+      const raw = await callAI(modelId, apiKeys, [{role:"user", content:`${WEEKLY_PROMPT}\n\n---\n${logs}`}], null, 1000);
+      let data = null;
+      try{ data = JSON.parse(raw.replace(/```json|```/g,"").trim()); }catch(e){}
+      if(!data){ showToast("解析に失敗しました", "err"); return; }
+      setReview(data);
+      showToast("✓ 分析完了", "ok");
+    }catch(e){ showToast("エラー: "+e.message, "err"); }
+    finally{ setIsGenerating(false); }
+  }
+
+  async function saveReview(){
+    if(!review || savedId) return;
+    const id = `review_${Date.now()}`;
+    const label = range===7 ? "週次" : "月次";
+    const content = [
+      `${review.period} ${label}レビュー`,
+      "",
+      `【総評】${review.summary}`,
+      "",
+      review.patterns?.length>0 ? "【発見したパターン】\n"+review.patterns.map(p=>`・${p.title}: ${p.detail}`).join("\n") : "",
+      "",
+      review.goodRoutine ? `【調子が良かった日の共通点】${review.goodRoutine}` : "",
+      review.badRoutine  ? `【調子が低かった日の共通点】${review.badRoutine}` : "",
+      "",
+      review.suggestions?.length>0 ? "【来週試すこと】\n"+review.suggestions.map(s=>`・${s}`).join("\n") : "",
+      "",
+      review.question ? `【来週の問い】${review.question}` : "",
+    ].filter(Boolean).join("\n");
+
+    const session = {
+      id, date: new Date().toISOString(),
+      title: `${review.period} ${label}レビュー`,
+      summary: review.summary,
+      tags: [label+"レビュー", "分析"],
+      insights: review.suggestions || [],
+      messageCount: 0,
+      messages: [{role:"user", content:content}, {role:"assistant", content:"（自動生成された"+label+"レビューです）"}],
+      source: "Review", model: modelId,
+    };
+    const updated = [session, ...sessions.filter(s=>s.id!==id)];
+    await persist(updated);
+    setSavedId(id);
+    showToast("✓ ログに保存しました", "ok");
+  }
+
+  const targetCount = getTargetSessions(range).length;
+
+  return(
+    <div style={{padding:"16px"}}>
+      {/* Range selector */}
+      <div style={{display:"flex",gap:8,marginBottom:16}}>
+        {[{v:7,l:"週次（7日）"},{v:30,l:"月次（30日）"}].map(({v,l})=>(
+          <button key={v} onClick={()=>{setRange(v);setReview(null);setSavedId(null);}}
+            style={{flex:1,padding:"10px",borderRadius:10,cursor:"pointer",
+              backgroundColor:range===v?C.accentDim:"transparent",
+              border:`1px solid ${range===v?C.accent:C.border}`,
+              color:range===v?C.accent:C.textSec,fontSize:13,fontWeight:range===v?600:400}}>
+            {l}
+          </button>
+        ))}
+      </div>
+
+      {/* Info */}
+      <div style={{backgroundColor:C.card,borderRadius:10,padding:"12px 14px",marginBottom:16,border:`1px solid ${C.border}`}}>
+        <div style={{fontSize:11,color:C.accent,marginBottom:4,letterSpacing:"0.08em"}}>分析対象</div>
+        <div style={{fontSize:22,fontWeight:700,color:C.text}}>{targetCount}<span style={{fontSize:13,fontWeight:400,color:C.textSec,marginLeft:4}}>件の記録</span></div>
+        <div style={{fontSize:11,color:C.textDim,marginTop:4}}>夜の行動・朝の状態・パフォーマンスのパターンを分析します</div>
+      </div>
+
+      {/* Generate button */}
+      <button onClick={generate} disabled={isGenerating||targetCount===0}
+        style={{width:"100%",padding:"13px",borderRadius:10,marginBottom:16,
+          backgroundColor:isGenerating||targetCount===0?C.textDim:C.accentDim,
+          border:`1px solid ${isGenerating||targetCount===0?C.border:C.accent}`,
+          color:isGenerating||targetCount===0?C.bg:C.accent,
+          fontSize:14,cursor:isGenerating||targetCount===0?"default":"pointer",fontWeight:600}}>
+        {isGenerating ? "AIが分析中..." : "✦ 分析を生成"}
+      </button>
+
+      {/* Review result */}
+      {review&&(
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {/* Header */}
+          <div style={{backgroundColor:C.accentBg,border:`1px solid ${C.accentDim}`,borderRadius:12,padding:"14px 16px"}}>
+            <div style={{fontSize:11,color:C.accent,marginBottom:6,letterSpacing:"0.08em"}}>{review.period} レビュー</div>
+            <div style={{fontSize:13,color:C.text,lineHeight:1.8}}>{review.summary}</div>
+          </div>
+
+          {/* Patterns */}
+          {review.patterns?.length>0&&(
+            <div style={{backgroundColor:C.card,borderRadius:12,padding:"14px 16px",border:`1px solid ${C.border}`}}>
+              <div style={{fontSize:11,color:C.accent,marginBottom:10,letterSpacing:"0.08em"}}>発見したパターン</div>
+              {review.patterns.map((p,i)=>(
+                <div key={i} style={{marginBottom:i<review.patterns.length-1?10:0}}>
+                  <div style={{fontSize:13,fontWeight:600,color:C.text,marginBottom:3}}>{p.title}</div>
+                  <div style={{fontSize:12,color:C.textSec,lineHeight:1.7}}>{p.detail}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Good / Bad */}
+          {(review.goodRoutine||review.badRoutine)&&(
+            <div style={{display:"flex",gap:8}}>
+              {review.goodRoutine&&(
+                <div style={{flex:1,backgroundColor:C.okBg,border:`1px solid ${C.ok}`,borderRadius:12,padding:"12px 14px"}}>
+                  <div style={{fontSize:10,color:C.ok,marginBottom:6,letterSpacing:"0.08em"}}>調子が良かった日</div>
+                  <div style={{fontSize:12,color:C.text,lineHeight:1.7}}>{review.goodRoutine}</div>
+                </div>
+              )}
+              {review.badRoutine&&(
+                <div style={{flex:1,backgroundColor:C.errBg,border:`1px solid ${C.err}`,borderRadius:12,padding:"12px 14px"}}>
+                  <div style={{fontSize:10,color:C.err,marginBottom:6,letterSpacing:"0.08em"}}>調子が低かった日</div>
+                  <div style={{fontSize:12,color:C.text,lineHeight:1.7}}>{review.badRoutine}</div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Suggestions */}
+          {review.suggestions?.length>0&&(
+            <div style={{backgroundColor:C.card,borderRadius:12,padding:"14px 16px",border:`1px solid ${C.border}`}}>
+              <div style={{fontSize:11,color:C.accent,marginBottom:10,letterSpacing:"0.08em"}}>来週試してみること</div>
+              {review.suggestions.map((s,i)=>(
+                <div key={i} style={{display:"flex",gap:8,marginBottom:i<review.suggestions.length-1?8:0,fontSize:13,color:C.text,lineHeight:1.6}}>
+                  <span style={{color:C.accentDim,flexShrink:0}}>✦</span><span>{s}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Question */}
+          {review.question&&(
+            <div style={{backgroundColor:C.card,borderRadius:12,padding:"14px 16px",border:`1px solid ${C.border}`}}>
+              <div style={{fontSize:11,color:C.accent,marginBottom:6,letterSpacing:"0.08em"}}>来週の問い</div>
+              <div style={{fontSize:13,color:C.text,lineHeight:1.7,fontStyle:"italic"}}>「{review.question}」</div>
+            </div>
+          )}
+
+          {/* Save button */}
+          <button onClick={saveReview} disabled={!!savedId}
+            style={{width:"100%",padding:"11px",borderRadius:10,
+              backgroundColor:savedId?C.okBg:"transparent",
+              border:`1px solid ${savedId?C.ok:C.border}`,
+              color:savedId?C.ok:C.textSec,
+              fontSize:13,cursor:savedId?"default":"pointer"}}>
+            {savedId ? "✓ ログに保存済み" : "この分析をログに保存"}
+          </button>
+        </div>
+      )}
+
+      {sessions.length===0&&(
+        <div style={{textAlign:"center",padding:"40px 0",color:C.textDim,fontSize:13}}>
+          まだ記録がありません。<br/>チャットで振り返りを記録しましょう。
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── EXPORT VIEW ───────────────────────────────────────────────
+function ExportView({sessions,showToast}){
+  const [format,setFormat]=useState("json");
+  const [range,setRange]=useState("all");
+  const [filterSource,setFilterSource]=useState("all");
+  const sources=[...new Set(sessions.map(s=>s.source).filter(Boolean))];
+  function getTargets(){ let s=[...sessions]; if(filterSource!=="all") s=s.filter(x=>x.source===filterSource); if(range==="month"){const d=new Date();d.setMonth(d.getMonth()-1);s=s.filter(x=>new Date(x.date)>=d);}else if(range==="week"){const d=new Date();d.setDate(d.getDate()-7);s=s.filter(x=>new Date(x.date)>=d);} return s; }
+  function doExport(){ const t=getTargets(); if(!t.length){showToast("対象の記録がありません","err");return;} if(format==="json") exportJSON(t); else if(format==="md") exportMarkdown(t); else exportText(t); showToast(`✓ ${t.length}件をエクスポートしました`,"ok"); }
+  const targets=getTargets();
+  const FBtn=({id,label,sub})=><div onClick={()=>setFormat(id)} style={{flex:1,padding:"12px 8px",borderRadius:10,cursor:"pointer",backgroundColor:format===id?C.accentBg:C.card,border:`1px solid ${format===id?C.accent:C.border}`,textAlign:"center"}}><div style={{fontSize:13,fontWeight:600,color:format===id?C.accent:C.text,marginBottom:2}}>{label}</div><div style={{fontSize:10,color:C.textDim}}>{sub}</div></div>;
+  const RBtn=({id,label})=><button onClick={()=>setRange(id)} style={{flex:1,padding:"8px",borderRadius:8,cursor:"pointer",backgroundColor:range===id?C.accentDim:"transparent",border:`1px solid ${range===id?C.accent:C.border}`,color:range===id?C.accent:C.textSec,fontSize:12}}>{label}</button>;
+  return(
+    <div style={{padding:"20px 16px"}}>
+      {/* 環境間移行の注意書き */}
+      <div style={{backgroundColor:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:16,fontSize:11,color:C.textSec,lineHeight:1.8}}>
+        💡 <b style={{color:C.text}}>環境間のデータ移行</b><br/>
+        {IS_CLAUDE?"Claude内 → ローカル版":"ローカル版 → Claude内"} に移行するには<b style={{color:C.text}}>JSON形式</b>でエクスポートし、移行先で「取り込み」してください。
+      </div>
+      {sessions.length===0?<div style={{textAlign:"center",padding:"40px 0",color:C.textDim,fontSize:13}}>エクスポートする記録がありません</div>:(
+        <>
+          <div style={{fontSize:11,color:C.textSec,marginBottom:8,letterSpacing:"0.08em"}}>フォーマット</div>
+          <div style={{display:"flex",gap:8,marginBottom:20}}><FBtn id="json" label="JSON" sub="移行・バックアップ用"/><FBtn id="md" label="Markdown" sub="Obsidian等"/><FBtn id="txt" label="テキスト" sub="汎用"/></div>
+          <div style={{fontSize:11,color:C.textSec,marginBottom:8,letterSpacing:"0.08em"}}>期間</div>
+          <div style={{display:"flex",gap:6,marginBottom:20}}><RBtn id="all" label="すべて"/><RBtn id="month" label="過去1ヶ月"/><RBtn id="week" label="過去1週間"/></div>
+          {sources.length>1&&<><div style={{fontSize:11,color:C.textSec,marginBottom:8,letterSpacing:"0.08em"}}>ソース</div><div style={{display:"flex",gap:6,marginBottom:20}}>{["all",...sources].map(s=><button key={s} onClick={()=>setFilterSource(s)} style={{padding:"6px 12px",borderRadius:8,cursor:"pointer",backgroundColor:filterSource===s?C.accentDim:"transparent",border:`1px solid ${filterSource===s?C.accent:C.border}`,color:filterSource===s?C.accent:C.textSec,fontSize:12}}>{s==="all"?"すべて":s}</button>)}</div></>}
+          <div style={{backgroundColor:C.card,borderRadius:10,padding:"12px 14px",marginBottom:20,border:`1px solid ${C.border}`}}>
+            <div style={{fontSize:11,color:C.accent,marginBottom:4,letterSpacing:"0.08em"}}>エクスポート対象</div>
+            <div style={{fontSize:24,fontWeight:700,color:C.text}}>{targets.length}<span style={{fontSize:13,fontWeight:400,color:C.textSec,marginLeft:4}}>件</span></div>
+          </div>
+          <button onClick={doExport} style={{width:"100%",padding:"13px",borderRadius:10,backgroundColor:C.accentDim,border:`1px solid ${C.accent}`,color:C.accent,fontSize:14,cursor:"pointer",fontWeight:600}}>↓ エクスポート</button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── IMPORT VIEW ───────────────────────────────────────────────
+function ImportView({modelId,apiKeys,sessions,persist,showToast,onGoToLogs}){
+  const [parsed,setParsed]=useState(null);
+  const [selected,setSelected]=useState(new Set());
+  const [importing,setImporting]=useState(false);
+  const [progress,setProgress]=useState({done:0,total:0});
+  const [dragOver,setDragOver]=useState(false);
+  const fileRef=useRef(null);
+  const existingIds=new Set(sessions.map(s=>s.sourceId).filter(Boolean));
+
+  function loadFile(file){
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        const text=e.target.result;
+        let convs=[];
+        // Detect file type
+        if(file.name.endsWith('.html')||file.name.endsWith('.htm')||text.trimStart().startsWith('<')){
+          // Gemini HTML format
+          convs=parseGeminiHTML(text);
+          if(!convs.length){showToast("Gemini会話が見つかりませんでした","err");return;}
+        } else {
+          // JSON format (Claude / ChatGPT / app)
+          const json=JSON.parse(text);
+          convs=detectAndParse(json);
+          if(!convs.length){showToast("対応する会話が見つかりませんでした","err");return;}
+        }
+        setParsed(convs);
+        setSelected(new Set(convs.filter(c=>!existingIds.has(c.sourceId)).map(c=>c.sourceId)));
+        showToast(`${convs.length}件を読み込みました`,"ok");
+      }catch(err){ showToast("ファイルの解析に失敗しました","err"); }
+    };
+    reader.readAsText(file,'utf-8');
+  }
+  function toggle(id){ const n=new Set(selected); n.has(id)?n.delete(id):n.add(id); setSelected(n); }
+
+  async function doImport(){
+    const targets=parsed.filter(c=>selected.has(c.sourceId)); if(!targets.length) return;
+    setImporting(true); setProgress({done:0,total:targets.length});
+    const newSessions=[];
+    for(const conv of targets){
+      try{
+        const txt=conv.messages.map(m=>`${m.role==="user"?"自分":"AI"}: ${m.content}`).join("\n\n").slice(0,6000);
+        const raw=await callAI(modelId,apiKeys,[{role:"user",content:`${EXTRACT_PROMPT}\n\n---\n${txt}`}],null,500);
+        let meta={title:conv.title,summary:"",tags:[],insights:[]};
+        try{ meta=JSON.parse(raw.replace(/```json|```/g,"").trim()); }catch(e){}
+        newSessions.push({id:`imported_${conv.sourceId}`,sourceId:conv.sourceId,date:conv.date,title:meta.title||conv.title,summary:meta.summary||"",tags:meta.tags||[],insights:meta.insights||[],messageCount:conv.messages.length,messages:conv.messages,source:conv.source});
+      }catch(e){
+        newSessions.push({id:`imported_${conv.sourceId}`,sourceId:conv.sourceId,date:conv.date,title:conv.title,summary:"",tags:[],insights:[],messageCount:conv.messages.length,messages:conv.messages,source:conv.source});
+      }
+      setProgress(p=>({...p,done:p.done+1}));
+    }
+    const updated=[...newSessions,...sessions.filter(s=>!newSessions.find(n=>n.sourceId===s.sourceId))];
+    await persist(updated); setImporting(false);
+    showToast(`✓ ${newSessions.length}件をインポートしました`,"ok");
+    setTimeout(()=>onGoToLogs(),1200);
+  }
+
+  const dupCount=parsed?parsed.filter(c=>existingIds.has(c.sourceId)).length:0;
+  return(
+    <div style={{padding:"16px"}}>
+      {/* 環境間移行の注意書き */}
+      <div style={{backgroundColor:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:14,fontSize:11,color:C.textSec,lineHeight:1.8}}>
+        💡 <b style={{color:C.text}}>対応フォーマット</b><br/>
+        ・Claude / ChatGPT の conversations.json（公式エクスポート）<br/>
+        ・このアプリでエクスポートしたJSON（環境間移行）<br/>
+        {IS_CLAUDE?"ローカル版":"Claude内版"}からのデータはJSONエクスポートで移行できます。
+      </div>
+      {!parsed&&(
+        <>
+          <div onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onDrop={e=>{e.preventDefault();setDragOver(false);loadFile(e.dataTransfer.files[0]);}} onClick={()=>fileRef.current?.click()}
+            style={{border:`2px dashed ${dragOver?C.accent:C.border}`,borderRadius:14,padding:"40px 24px",textAlign:"center",cursor:"pointer",backgroundColor:dragOver?C.accentBg:"transparent",marginBottom:12}}>
+            <div style={{fontSize:28,marginBottom:10}}>📂</div>
+            <div style={{color:C.textSec,fontSize:14,marginBottom:4}}>ドロップ or クリック</div>
+            <div style={{color:C.textDim,fontSize:11}}>JSON または Gemini HTML を選択</div>
+            <input ref={fileRef} type="file" accept=".json,.html,.htm" style={{display:"none"}} onChange={e=>loadFile(e.target.files[0])}/>
+          </div>
+          <div style={{backgroundColor:C.card,borderRadius:10,padding:"12px 14px",border:`1px solid ${C.border}`,fontSize:12,color:C.textSec,lineHeight:1.8}}>
+            <b style={{color:C.text}}>Claude</b>: Settings → Privacy → Export Data → conversations.json<br/>
+            <b style={{color:C.text}}>ChatGPT</b>: Settings → Data Controls → Export Data → conversations.json<br/>
+            <b style={{color:C.text}}>Gemini</b>: Google Takeout → マイアクティビティ.html をそのままドロップ
+          </div>
+        </>
+      )}
+      {parsed&&!importing&&(
+        <>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+            <span style={{fontSize:12,color:C.textSec}}><span style={{color:C.text,fontWeight:600}}>{parsed.length}件</span>{dupCount>0&&<span style={{color:C.textDim}}> ({dupCount}件済み)</span>}</span>
+            <button onClick={()=>setSelected(selected.size===parsed.length?new Set():new Set(parsed.map(c=>c.sourceId)))} style={{backgroundColor:"transparent",border:`1px solid ${C.border}`,borderRadius:8,padding:"4px 10px",color:C.textSec,fontSize:11,cursor:"pointer"}}>{selected.size===parsed.length?"全解除":"全選択"}</button>
+          </div>
+          <div style={{maxHeight:"38vh",overflowY:"auto",marginBottom:12}}>
+            {parsed.map(conv=>{ const isDup=existingIds.has(conv.sourceId),isSel=selected.has(conv.sourceId); return(
+              <div key={conv.sourceId} onClick={()=>toggle(conv.sourceId)} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:10,marginBottom:6,cursor:"pointer",backgroundColor:isSel?C.accentBg:C.card,border:`1px solid ${isSel?C.accentDim:C.border}`}}>
+                <div style={{width:16,height:16,borderRadius:4,border:`2px solid ${isSel?C.accent:C.textDim}`,backgroundColor:isSel?C.accent:"transparent",flexShrink:0,marginTop:2,display:"flex",alignItems:"center",justifyContent:"center"}}>{isSel&&<svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-5" stroke="#1a1200" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}</div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:"flex",justifyContent:"space-between",gap:8}}><span style={{fontSize:13,fontWeight:600,color:isDup?C.textDim:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{conv.title}</span><span style={{fontSize:10,color:C.textDim,flexShrink:0}}>{fmt(conv.date)}</span></div>
+                  <div style={{display:"flex",gap:6,marginTop:3}}><span style={{fontSize:10,padding:"1px 7px",borderRadius:8,backgroundColor:C.accentBg,color:C.accent,border:`1px solid ${C.accentDim}`}}>{conv.source}</span><span style={{fontSize:10,color:C.textDim}}>{conv.messages.length}件</span>{isDup&&<span style={{fontSize:10,color:C.textDim}}>インポート済み</span>}</div>
+                </div>
+              </div>
+            ); })}
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={()=>{setParsed(null);setSelected(new Set());}} style={{flex:1,padding:"10px",borderRadius:10,backgroundColor:"transparent",border:`1px solid ${C.border}`,color:C.textSec,fontSize:13,cursor:"pointer"}}>← 戻る</button>
+            <button onClick={doImport} disabled={!selected.size} style={{flex:2,padding:"10px",borderRadius:10,backgroundColor:selected.size?C.accentDim:"#2a2720",border:`1px solid ${selected.size?C.accent:C.border}`,color:selected.size?C.accent:C.textDim,fontSize:13,cursor:selected.size?"pointer":"default",fontWeight:500}}>{selected.size}件をインポート</button>
+          </div>
+        </>
+      )}
+      {importing&&(
+        <div style={{textAlign:"center",padding:"40px 0"}}>
+          <div style={{display:"flex",justifyContent:"center",marginBottom:20}}><Spinner/></div>
+          <div style={{color:C.text,fontSize:15,fontWeight:600,marginBottom:6}}>AIが解析中...</div>
+          <div style={{color:C.textSec,fontSize:13,marginBottom:16}}>{progress.done} / {progress.total} 件</div>
+          <div style={{backgroundColor:C.card,borderRadius:8,height:6,overflow:"hidden"}}><div style={{height:"100%",backgroundColor:C.accent,borderRadius:8,width:`${progress.total>0?(progress.done/progress.total)*100:0}%`,transition:"width 0.3s"}}/></div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── SESSION CARD ──────────────────────────────────────────────
+function SessionCard({session,onSelect}){
+  const [hover,setHover]=useState(false);
+  return(
+    <div onClick={()=>onSelect(session)} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
+      style={{backgroundColor:hover?C.cardHover:C.card,borderRadius:12,padding:"14px 16px",border:`1px solid ${C.border}`,marginBottom:8,cursor:"pointer",transition:"background-color 0.15s"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:5}}>
+        <span style={{fontSize:14,fontWeight:600,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",marginRight:8}}>{session.title}</span>
+        <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+          {session.source&&session.source!=="Journal"&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:6,backgroundColor:C.accentBg,color:C.accentDim,border:`1px solid ${C.accentDim}`}}>{session.source}</span>}
+          <span style={{fontSize:11,color:C.textDim}}>{fmt(session.date)}</span>
+        </div>
+      </div>
+      {session.summary&&<div style={{fontSize:12,color:C.textSec,lineHeight:1.6,marginBottom:session.tags?.length>0?8:0,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{session.summary}</div>}
+      {session.tags?.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:4}}>{session.tags.map(t=><span key={t} style={{fontSize:11,padding:"2px 9px",borderRadius:10,backgroundColor:C.bg,color:C.textSec,border:`1px solid ${C.border}`}}>#{t}</span>)}</div>}
+    </div>
+  );
+}
+
+function CalendarView({sessions,onSelectSession}){
+  const [month,setMonth]=useState(new Date()); const [selDay,setSelDay]=useState(null);
+  const y=month.getFullYear(),m=month.getMonth(),fd=new Date(y,m,1).getDay(),dim=new Date(y,m+1,0).getDate(),today=new Date();
+  const getS=(day)=>sessions.filter(s=>{const d=new Date(s.date);return d.getFullYear()===y&&d.getMonth()===m&&d.getDate()===day;});
+  return(
+    <div style={{padding:"16px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+        <button onClick={()=>setMonth(new Date(y,m-1))} style={{backgroundColor:"transparent",border:"none",color:C.textSec,fontSize:22,cursor:"pointer",padding:"4px 12px"}}>‹</button>
+        <span style={{color:C.text,fontSize:15,letterSpacing:"0.1em"}}>{y}年{m+1}月</span>
+        <button onClick={()=>setMonth(new Date(y,m+1))} style={{backgroundColor:"transparent",border:"none",color:C.textSec,fontSize:22,cursor:"pointer",padding:"4px 12px"}}>›</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",marginBottom:6}}>{["日","月","火","水","木","金","土"].map((d,i)=><div key={d} style={{textAlign:"center",fontSize:11,padding:"4px 0",color:i===0?"#8a5050":i===6?"#50608a":C.textDim}}>{d}</div>)}</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2}}>
+        {Array.from({length:fd}).map((_,i)=><div key={`e${i}`}/>)}
+        {Array.from({length:dim}).map((_,i)=>{ const day=i+1,ds=getS(day),has=ds.length>0,isToday=today.getFullYear()===y&&today.getMonth()===m&&today.getDate()===day,isSel=selDay===day,dow=(fd+i)%7; return(
+          <div key={day} onClick={()=>has&&setSelDay(isSel?null:day)} style={{aspectRatio:"1",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",borderRadius:8,gap:3,cursor:has?"pointer":"default",backgroundColor:isSel?C.accentDim:isToday?C.card:"transparent",border:isToday?`1px solid ${C.borderLight}`:"1px solid transparent"}}>
+            <span style={{fontSize:13,fontWeight:has?600:400,color:isSel?C.accent:dow===0?"#9a6060":dow===6?"#60709a":has?C.text:C.textDim}}>{day}</span>
+            {has&&<div style={{display:"flex",gap:2}}>{ds.slice(0,3).map((_,j)=><div key={j} style={{width:4,height:4,borderRadius:"50%",backgroundColor:C.accent}}/>)}</div>}
+          </div>
+        ); })}
+      </div>
+      {selDay&&<div style={{marginTop:20}}><div style={{fontSize:12,color:C.textSec,marginBottom:10}}>{m+1}月{selDay}日の記録</div>{getS(selDay).map(s=><SessionCard key={s.id} session={s} onSelect={onSelectSession}/>)}</div>}
+    </div>
+  );
+}
+
+function LogsView({sessions,onSelectSession}){
+  const [search,setSearch]=useState(""); const [activeTag,setActiveTag]=useState(null); const [activeSrc,setActiveSrc]=useState(null);
+  const allTags=[...new Set(sessions.flatMap(s=>s.tags||[]))];
+  const sources=[...new Set(sessions.map(s=>s.source).filter(Boolean))];
+  const filtered=sessions.filter(s=>{ const q=search.toLowerCase(); const mq=!q||s.title?.toLowerCase().includes(q)||s.summary?.toLowerCase().includes(q)||s.tags?.some(t=>t.toLowerCase().includes(q))||s.insights?.some(i=>i.toLowerCase().includes(q))||s.messages?.some(m=>m.content?.toLowerCase().includes(q)); return mq&&(!activeTag||s.tags?.includes(activeTag))&&(!activeSrc||s.source===activeSrc); });
+  return(
+    <div style={{padding:"16px"}}>
+      <div style={{position:"relative",marginBottom:12}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="キーワードで検索（会話本文も対象）..."
+          style={{width:"100%",backgroundColor:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px 10px 36px",color:C.text,fontSize:13,outline:"none",boxSizing:"border-box",fontFamily:"'Noto Sans JP',sans-serif"}}/>
+        <svg style={{position:"absolute",left:12,top:"50%",transform:"translateY(-50%)"}} width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="8" stroke={C.textDim} strokeWidth="2"/><path d="M21 21l-4.35-4.35" stroke={C.textDim} strokeWidth="2" strokeLinecap="round"/></svg>
+      </div>
+      {sources.length>1&&<div style={{display:"flex",gap:6,marginBottom:10}}>{["all",...sources].map(s=><span key={s} onClick={()=>setActiveSrc(s==="all"?null:activeSrc===s?null:s)} style={{fontSize:11,padding:"3px 10px",borderRadius:12,cursor:"pointer",backgroundColor:(s==="all"&&!activeSrc)||activeSrc===s?C.accent:C.card,color:(s==="all"&&!activeSrc)||activeSrc===s?"#1a1200":C.textSec,border:`1px solid ${(s==="all"&&!activeSrc)||activeSrc===s?C.accent:C.border}`}}>{s==="all"?"すべて":s}</span>)}</div>}
+      {allTags.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>{allTags.map(t=><span key={t} onClick={()=>setActiveTag(activeTag===t?null:t)} style={{fontSize:11,padding:"3px 10px",borderRadius:12,cursor:"pointer",backgroundColor:activeTag===t?C.accent:C.card,color:activeTag===t?"#1a1200":C.textSec,border:`1px solid ${activeTag===t?C.accent:C.border}`,fontWeight:activeTag===t?600:400}}>#{t}</span>)}</div>}
+      <div style={{fontSize:11,color:C.textDim,marginBottom:10}}>{filtered.length}件の記録</div>
+      {filtered.length===0?<div style={{textAlign:"center",padding:"40px 0",color:C.textDim,fontSize:13}}>{sessions.length===0?"まだ記録がありません":"該当なし"}</div>:filtered.map(s=><SessionCard key={s.id} session={s} onSelect={onSelectSession}/>)}
+    </div>
+  );
+}
+
+function SessionDetail({session,onBack,onDelete}){
+  const [showMsgs,setShowMsgs]=useState(false);
+  const [deleting,setDeleting]=useState(false);
+  const [confirmDelete,setConfirmDelete]=useState(false);
+
+  async function handleDelete(){
+    setDeleting(true);
+    try{ await onDelete(session.id); }
+    catch(e){ setDeleting(false); setConfirmDelete(false); }
+  }
+
+  return(
+    <div style={{padding:"16px"}}>
+      <button onClick={onBack} style={{backgroundColor:"transparent",border:"none",color:C.textSec,cursor:"pointer",fontSize:13,padding:"0 0 16px 0"}}>‹ 戻る</button>
+      <div style={{fontSize:11,color:C.textDim,marginBottom:4}}>
+        {fmtFull(session.date)}
+        {session.source&&session.source!=="Journal"&&<span style={{marginLeft:8,padding:"1px 6px",borderRadius:6,backgroundColor:C.accentBg,color:C.accentDim,border:`1px solid ${C.accentDim}`,fontSize:10}}>{session.source}</span>}
+        {session.model&&<span style={{marginLeft:6,padding:"1px 6px",borderRadius:6,backgroundColor:C.card,color:C.textDim,border:`1px solid ${C.border}`,fontSize:10}}>{MODELS[session.model]?.label||session.model}</span>}
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,flex:1}}>{session.title}</div>
+        <button onClick={()=>exportSingleMd(session)} style={{backgroundColor:"transparent",border:`1px solid ${C.border}`,borderRadius:8,padding:"4px 10px",color:C.textSec,fontSize:11,cursor:"pointer",flexShrink:0,marginLeft:8}}>MD保存</button>
+      </div>
+
+      {/* Summary */}
+      {session.summary&&(
+        <div style={{backgroundColor:C.card,borderRadius:10,padding:"12px 14px",marginBottom:10,border:`1px solid ${C.border}`}}>
+          <div style={{fontSize:10,color:C.accent,marginBottom:6,letterSpacing:"0.12em"}}>SUMMARY</div>
+          <div style={{fontSize:13,color:C.textSec,lineHeight:1.7}}>{session.summary}</div>
+        </div>
+      )}
+
+      {/* Bias analysis（野性センサー結果） */}
+      {session.bias&&(
+        <div style={{backgroundColor:C.errBg,borderRadius:10,padding:"14px 16px",marginBottom:10,border:`1px solid ${C.err}33`}}>
+          <div style={{fontSize:10,color:C.err,marginBottom:10,letterSpacing:"0.12em"}}>⚠️ 思考デバッグ</div>
+          {session.bias.trigger&&(
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:11,color:C.err,opacity:0.7,marginBottom:3}}>トリガー</div>
+              <div style={{fontSize:13,color:C.text,lineHeight:1.7}}>{session.bias.trigger}</div>
+            </div>
+          )}
+          {session.bias.raw_reaction&&(
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:11,color:C.err,opacity:0.7,marginBottom:3}}>野生の反応</div>
+              <div style={{fontSize:13,color:C.text,lineHeight:1.7}}>{session.bias.raw_reaction}</div>
+            </div>
+          )}
+          {session.bias.value_exposed&&(
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:11,color:C.err,opacity:0.7,marginBottom:3}}>露わになった価値観</div>
+              <div style={{fontSize:13,color:C.text,lineHeight:1.7}}>{session.bias.value_exposed}</div>
+            </div>
+          )}
+          {session.bias.bias_pattern&&(
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:11,color:C.err,opacity:0.7,marginBottom:3}}>思考の癖</div>
+              <div style={{fontSize:13,color:C.text,lineHeight:1.7}}>{session.bias.bias_pattern}</div>
+            </div>
+          )}
+          {session.bias.debug_question&&(
+            <div style={{backgroundColor:`${C.err}15`,borderRadius:8,padding:"10px 12px"}}>
+              <div style={{fontSize:11,color:C.err,opacity:0.7,marginBottom:3}}>掘り下げる問い</div>
+              <div style={{fontSize:13,color:C.text,lineHeight:1.7,fontStyle:"italic"}}>「{session.bias.debug_question}」</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Insights */}
+      {session.insights?.length>0&&(
+        <div style={{backgroundColor:C.card,borderRadius:10,padding:"12px 14px",marginBottom:10,border:`1px solid ${C.border}`}}>
+          <div style={{fontSize:10,color:C.accent,marginBottom:8,letterSpacing:"0.12em"}}>INSIGHTS</div>
+          {session.insights.map((ins,i)=>(
+            <div key={i} style={{display:"flex",gap:8,marginBottom:6,fontSize:13,color:C.text,lineHeight:1.6}}>
+              <span style={{color:C.accentDim,flexShrink:0}}>✦</span><span>{ins}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Tags */}
+      {session.tags?.length>0&&(
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:14}}>
+          {session.tags.map(t=><span key={t} style={{fontSize:11,padding:"3px 10px",borderRadius:12,backgroundColor:C.card,color:C.textSec,border:`1px solid ${C.border}`}}>#{t}</span>)}
+        </div>
+      )}
+
+      {/* Chat log */}
+      {session.messages?.length>0&&(
+        <>
+          <button onClick={()=>setShowMsgs(!showMsgs)} style={{width:"100%",backgroundColor:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",color:C.textSec,cursor:"pointer",fontSize:13,textAlign:"left",marginBottom:8}}>
+            {showMsgs?"▾":"▸"} 会話ログ ({session.messageCount}件)
+          </button>
+          {showMsgs&&<div style={{marginBottom:12}}>{session.messages.map((m,i)=><Bubble key={i} msg={m}/>)}</div>}
+        </>
+      )}
+
+      {/* Delete — custom confirm UI (window.confirm blocked in iframe) */}
+      {!confirmDelete ? (
+        <button onClick={()=>setConfirmDelete(true)}
+          style={{width:"100%",backgroundColor:"transparent",border:`1px solid ${C.border}`,borderRadius:10,padding:10,color:C.err,cursor:"pointer",fontSize:12,marginTop:4}}>
+          この記録を削除
+        </button>
+      ) : (
+        <div style={{marginTop:4,backgroundColor:C.errBg,border:`1px solid ${C.err}55`,borderRadius:10,padding:"12px 14px"}}>
+          <div style={{fontSize:13,color:C.text,marginBottom:10,textAlign:"center"}}>本当に削除しますか？</div>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={()=>setConfirmDelete(false)}
+              style={{flex:1,padding:"8px",borderRadius:8,backgroundColor:C.card,border:`1px solid ${C.border}`,color:C.textSec,cursor:"pointer",fontSize:13}}>
+              キャンセル
+            </button>
+            <button onClick={handleDelete} disabled={deleting}
+              style={{flex:1,padding:"8px",borderRadius:8,backgroundColor:C.err,border:"none",color:"#fff",cursor:deleting?"default":"pointer",fontSize:13,fontWeight:600}}>
+              {deleting ? "削除中..." : "削除する"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── MAIN APP ─────────────────────────────────────────────────
+function App(){
+  const [phase,setPhase]=useState("loading");
+  const [modelId,setModelId]=useState("gemini");
+  const [apiKeys,setApiKeys]=useState({claude:"",gemini:"",gpt:""});
+  const [saveMode,setSaveMode]=useState("browser");
+  const [dirHandle,setDirHandle]=useState(null);
+  const [sessions,setSessions]=useState([]);
+  const [view,setView]=useState("chat");
+  const [sel,setSel]=useState(null);
+  const [showSettings,setShowSettings]=useState(false);
+  const [toast,setToast]=useState({msg:"",type:""});
+  const [messages,setMessages]=useState([]);
+  const [savedMeta,setSavedMeta]=useState(null);
+  const [sessionId,setSessionId]=useState(()=>`s_${Date.now()}`);
+  const [installPrompt,setInstallPrompt]=useState(null);
+
+  function showToast(msg,type="info"){ setToast({msg,type}); setTimeout(()=>setToast({msg:"",type:""}),3000); }
+
+  async function persist(updated){
+    setSessions(updated);
+    if(IS_CLAUDE){
+      await store.set(KEY_SESSIONS,JSON.stringify(updated));
+    } else if(saveMode==="local"&&dirHandle){
+      const ok=await writeLocalFile(dirHandle,updated);
+      if(!ok) showToast("⚠ ファイル保存に失敗しました","err");
+    } else {
+      await store.set(KEY_SESSIONS,JSON.stringify(updated));
+    }
+  }
+
+  // Boot
+  useEffect(()=>{
+    (async()=>{
+      window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();setInstallPrompt(e);});
+
+      // Load saved model + keys
+      const savedModel=await store.get(KEY_MODEL);
+      const savedKeys=await store.get(KEY_APIKEY);
+      if(savedModel) setModelId(savedModel);
+      if(savedKeys){ try{ setApiKeys(JSON.parse(savedKeys)); }catch(e){} }
+
+      if(IS_CLAUDE){
+        // Claude env: load from window.storage
+        const raw=await store.get(KEY_SESSIONS);
+        if(raw){ try{ const p=JSON.parse(raw); if(Array.isArray(p)) setSessions(p); }catch(e){} }
+        // Check if model is set
+        if(!savedModel){ setPhase("modelSetup"); return; }
+        setPhase("ready");
+      } else {
+        // Local env
+        const mode=await store.get(KEY_SAVE_MODE)||"";
+        if(!mode){ setPhase("storageSetup"); return; }
+        setSaveMode(mode);
+        if(mode==="local"){
+          const h=await getSavedDirHandle();
+          if(h){ setDirHandle(h); setSessions(await readLocalFile(h)); }
+          else{ if(!savedModel){ setPhase("storageSetup"); return; } setPhase("folderPick"); return; }
+        } else {
+          const raw=await store.get(KEY_SESSIONS);
+          if(raw){ try{ const p=JSON.parse(raw); if(Array.isArray(p)) setSessions(p); }catch(e){} }
+        }
+        if(!savedModel){ setPhase("modelSetup"); return; }
+        setPhase("ready");
+      }
+    })();
+  },[]);
+
+  async function handleStorageChoice(mode,h){
+    await store.set(KEY_SAVE_MODE,mode);
+    setSaveMode(mode);
+    if(mode==="local"&&h){ setDirHandle(h); setSessions(await readLocalFile(h)); }
+    setPhase("modelSetup");
+  }
+
+  async function handleModelSave(mid,keys){
+    await store.set(KEY_MODEL,mid);
+    await store.set(KEY_APIKEY,JSON.stringify(keys));
+    setModelId(mid); setApiKeys(keys);
+    setPhase("ready");
+  }
+
+  async function handleFolderPick(h){ setDirHandle(h); setSessions(await readLocalFile(h)); setPhase("ready"); }
+  async function handleSwitchToBrowser(){ await store.set(KEY_SAVE_MODE,"browser"); setSaveMode("browser"); await idbDel(IDB_KEY); setDirHandle(null); const raw=await store.get(KEY_SESSIONS); if(raw){try{const p=JSON.parse(raw);if(Array.isArray(p))setSessions(p);}catch(e){}} setPhase("ready"); }
+  async function deleteSession(id){ const u=sessions.filter(s=>s.id!==id); await persist(u); setSel(null); showToast("削除しました","ok"); }
+
+  if(phase==="loading") return <div style={{minHeight:"100vh",backgroundColor:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:16}}><Spinner/><div style={{color:C.textDim,fontSize:13}}>読み込み中...</div></div></div>;
+  if(phase==="storageSetup") return <StorageSetup onComplete={handleStorageChoice}/>;
+  if(phase==="modelSetup") return <ModelSetup onSave={handleModelSave} isClaude={IS_CLAUDE}/>;
+  if(phase==="folderPick") return <FolderRepick onPicked={handleFolderPick} onSwitchToBrowser={handleSwitchToBrowser}/>;
+
+  const VIEWS=[
+    {id:"chat",label:"チャット",path:"M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"},
+    {id:"calendar",label:"カレンダー",path:"M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z"},
+    {id:"logs",label:"ログ",path:"M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 1 1 0 4H11a2 2 0 0 1-2-2z"},
+    {id:"review",label:"分析",path:"M9 19v-6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2zm0 0V9a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v10m-6 0a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2m0 0V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v14a2 2 0 0 0-2 2h-2a2 2 0 0 1-2-2z"},
+    {id:"export",label:"書き出し",path:"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"},
+    {id:"import",label:"取り込み",path:"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"},
+  ];
+  const titleMap={chat:"Journal",calendar:"Calendar",logs:"Logs",review:"Review",export:"Export",import:"Import"};
+
+  return(
+    <div style={{minHeight:"100vh",backgroundColor:C.bg,color:C.text,fontFamily:"'Noto Sans JP',sans-serif",display:"flex",flexDirection:"column",maxWidth:720,margin:"0 auto"}}>
+      <Toast msg={toast.msg} type={toast.type}/>
+      <div style={{padding:"16px 20px 12px",borderBottom:`1px solid ${C.border}`,backgroundColor:C.surface,display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:12,letterSpacing:"0.2em",color:C.accent,textTransform:"uppercase"}}>{showSettings?"Settings":sel?"詳細":titleMap[view]}</span>
+          {!showSettings&&!sel&&(
+            <span style={{fontSize:9,padding:"1px 7px",borderRadius:6,backgroundColor:IS_CLAUDE?C.infoBg:C.okBg,color:IS_CLAUDE?C.info:C.ok,border:`1px solid ${IS_CLAUDE?C.info:C.ok}`}}>
+              {IS_CLAUDE?"Claude内":"ローカル"}
+            </span>
+          )}
+          {!showSettings&&!sel&&(
+            <span style={{fontSize:9,padding:"1px 7px",borderRadius:6,backgroundColor:C.card,color:C.textDim,border:`1px solid ${C.border}`}}>
+              {MODELS[modelId]?.label||modelId}
+            </span>
+          )}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {!showSettings&&!sel&&view==="logs"&&sessions.length>0&&<span style={{fontSize:11,color:C.textDim}}>{sessions.length}件</span>}
+          {!showSettings&&!sel&&view==="chat"&&savedMeta&&<span style={{fontSize:11,color:C.accentDim}}>✦ 保存済み</span>}
+          {installPrompt&&!showSettings&&<button onClick={async()=>{installPrompt.prompt();const r=await installPrompt.userChoice;if(r.outcome==="accepted")setInstallPrompt(null);}} style={{backgroundColor:C.accentDim,border:`1px solid ${C.accent}`,borderRadius:8,padding:"4px 10px",color:C.accent,fontSize:11,cursor:"pointer"}}>インストール</button>}
+          <button onClick={()=>{setShowSettings(!showSettings);setSel(null);}} style={{backgroundColor:showSettings?C.accentDim:"transparent",border:`1px solid ${showSettings?C.accent:C.border}`,borderRadius:8,padding:"4px 10px",color:showSettings?C.accent:C.textDim,cursor:"pointer",fontSize:12}}>⚙ 設定</button>
+        </div>
+      </div>
+
+      <div style={{flex:1,overflowY:"auto",paddingBottom:IS_CLAUDE?0:72}}>
+        {showSettings?(
+          <SettingsView modelId={modelId} apiKeys={apiKeys} saveMode={saveMode} dirHandle={dirHandle}
+            onUpdateModel={async(mid,keys)=>{ await store.set(KEY_MODEL,mid); await store.set(KEY_APIKEY,JSON.stringify(keys)); setModelId(mid); setApiKeys(keys); showToast("モデル設定を保存しました","ok"); }}
+            onChangeFolder={async h=>{ setDirHandle(h); setSessions(await readLocalFile(h)); }}
+            onSwitchMode={async(mode,h)=>{ await store.set(KEY_SAVE_MODE,mode); setSaveMode(mode); if(mode==="local"&&h){ setDirHandle(h); setSessions(await readLocalFile(h)); } else if(mode==="browser"){ setDirHandle(null); await idbDel(IDB_KEY); const raw=await store.get(KEY_SESSIONS); if(raw){try{const p=JSON.parse(raw);if(Array.isArray(p))setSessions(p);}catch(e){}} } }}
+            onClose={()=>setShowSettings(false)} showToast={showToast}/>
+        ):sel?(
+          <SessionDetail session={sel} onBack={()=>setSel(null)} onDelete={deleteSession}/>
+        ):(
+          <>
+            <div style={{display:view==="chat"?"block":"none"}}>
+              <ChatView modelId={modelId} apiKeys={apiKeys} messages={messages} setMessages={setMessages} savedMeta={savedMeta} setSavedMeta={setSavedMeta} sessions={sessions} persist={persist} sessionId={sessionId} onNewChat={()=>{setMessages([]);setSavedMeta(null);setSessionId(`s_${Date.now()}`);}} onGoToLogs={()=>setView("logs")} showToast={showToast}/>
+            </div>
+            <div style={{display:view==="calendar"?"block":"none"}}><CalendarView sessions={sessions} onSelectSession={setSel}/></div>
+            <div style={{display:view==="logs"?"block":"none"}}><LogsView sessions={sessions} onSelectSession={setSel}/></div>
+            <div style={{display:view==="export"?"block":"none"}}><ExportView sessions={sessions} showToast={showToast}/></div>
+            <div style={{display:view==="review"?"block":"none"}}><WeeklyReviewView modelId={modelId} apiKeys={apiKeys} sessions={sessions} persist={persist} showToast={showToast}/></div>
+            <div style={{display:view==="import"?"block":"none"}}><ImportView modelId={modelId} apiKeys={apiKeys} sessions={sessions} persist={persist} showToast={showToast} onGoToLogs={()=>setView("logs")}/></div>
+          </>
+        )}
+      </div>
+
+      {!sel&&!showSettings&&(
+        <div style={{position:IS_CLAUDE?"sticky":"fixed",bottom:0,left:IS_CLAUDE?"auto":"50%",transform:IS_CLAUDE?"none":"translateX(-50%)",width:"100%",maxWidth:720,backgroundColor:C.surface,borderTop:`1px solid ${C.border}`,display:"flex",zIndex:20}}>
+          {VIEWS.map(v=>{ const active=view===v.id; return(
+            <button key={v.id} onClick={()=>{setView(v.id);setSel(null);}} style={{flex:1,padding:"12px 4px 10px",backgroundColor:"transparent",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3,color:active?C.accent:C.textDim,fontSize:9,letterSpacing:"0.03em",position:"relative"}}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={active?2:1.5} strokeLinecap="round" strokeLinejoin="round"><path d={v.path}/></svg>
+              {v.label}
+              {v.id==="logs"&&sessions.length>0&&<span style={{position:"absolute",top:8,right:"50%",transform:"translateX(10px)",fontSize:8,backgroundColor:C.accentDim,color:C.accent,borderRadius:6,padding:"0 4px",lineHeight:"13px"}}>{sessions.length}</span>}
+            </button>
+          ); })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Journal data (personal data, do not commit)
+journal-data.json
+*.json.bak
+
+# OS files
+.DS_Store
+Thumbs.db
