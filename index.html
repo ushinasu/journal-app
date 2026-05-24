@@ -422,19 +422,24 @@ function Spinner(){ return <div style={{width:18,height:18,border:`2px solid ${C
 function Bubble({msg}){ const u=msg.role==="user"; return <div style={{display:"flex",justifyContent:u?"flex-end":"flex-start",marginBottom:10,padding:"0 16px"}}><div style={{maxWidth:"78%",padding:"10px 14px",fontSize:14,lineHeight:1.65,borderRadius:u?"18px 18px 4px 18px":"18px 18px 18px 4px",backgroundColor:u?C.accent:C.surface,color:u?"#fff":C.text,fontWeight:u?500:400,border:u?"none":`1px solid ${C.border}`}}>{msg.content.split("\n").map((l,i,a)=><span key={i}>{l}{i<a.length-1&&<br/>}</span>)}</div></div>; }
 
 // ── ENV BANNER ────────────────────────────────────────────────
-function EnvBanner(){
+function EnvBanner({saveMode, gdriveToken}){
+  const driveConnected = saveMode==="gdrive" && gdriveToken;
   if(IS_CLAUDE){
     return(
-      <div style={{backgroundColor:C.infoBg,border:`1px solid ${C.info}`,borderRadius:8,padding:"8px 12px",margin:"12px 16px 0",fontSize:11,color:C.info,lineHeight:1.7}}>
-        📌 <b>Claude内で動作中</b> — データはClaudeアプリ内に保存されています。<br/>
-        ローカル版へ移行する場合は「書き出し」→ JSON形式 → ローカル版で「取り込み」してください。
+      <div style={{backgroundColor:driveConnected?C.okBg:C.infoBg,border:`1px solid ${driveConnected?C.ok:C.info}`,borderRadius:8,padding:"8px 12px",margin:"12px 16px 0",fontSize:11,color:driveConnected?C.ok:C.info,lineHeight:1.7}}>
+        {driveConnected
+          ? <>☁ <b>Claude内 + Google Drive同期中</b> — インポート・分析結果がDriveに保存されます。</>
+          : <>📌 <b>Claude内で動作中</b> — 設定からGoogle Driveに接続するとデータを永続保存できます。</>
+        }
       </div>
     );
   }
   return(
-    <div style={{backgroundColor:C.okBg,border:`1px solid ${C.ok}`,borderRadius:8,padding:"8px 12px",margin:"12px 16px 0",fontSize:11,color:C.ok,lineHeight:1.7}}>
-      📁 <b>ローカルで動作中</b> — データはPCのフォルダ（journal-data.json）に保存されています。<br/>
-      Claude内版とデータを共有するには「書き出し」→ JSON → Claude版で「取り込み」してください。
+    <div style={{backgroundColor:driveConnected?C.okBg:C.infoBg,border:`1px solid ${driveConnected?C.ok:C.info}`,borderRadius:8,padding:"8px 12px",margin:"12px 16px 0",fontSize:11,color:driveConnected?C.ok:C.info,lineHeight:1.7}}>
+      {driveConnected
+        ? <>☁ <b>Google Drive同期中</b> — データは自動的にDriveに保存されます。</>
+        : <>📁 <b>ローカルで動作中</b> — データはPCのフォルダ（journal-data.json）に保存されています。</>
+      }
     </div>
   );
 }
@@ -709,7 +714,7 @@ function SettingsView({modelId,apiKeys,saveMode,dirHandle,gdriveClientId,gdriveT
       )}
 
       {/* GOOGLE DRIVE */}
-      {!IS_CLAUDE&&(
+      {(
         <Section title="Google Drive 同期">
           {saveMode==="gdrive"&&gdriveToken?(
             <div>
@@ -972,7 +977,7 @@ function ChatView({modelId,apiKeys,messages,setMessages,savedMeta,setSavedMeta,s
   return(
     <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 116px)"}}>
       <div style={{flex:1,overflowY:"auto",padding:"16px 0"}}>
-        <EnvBanner/>
+        <EnvBanner saveMode={saveMode} gdriveToken={gdriveToken}/>
         {messages.length===0&&(
           <div style={{padding:"24px 24px 12px",textAlign:"center"}}>
             <div style={{fontSize:26,marginBottom:8,color:C.accent}}>✦</div>
@@ -1574,17 +1579,16 @@ function App(){
 
   async function persist(updated){
     setSessions(updated);
-    if(IS_CLAUDE){
-      await store.set(KEY_SESSIONS,JSON.stringify(updated));
-    } else if(saveMode==="gdrive"&&gdriveToken){
+    if(saveMode==="gdrive"&&gdriveToken){
       try{
         const newId=await gdriveWrite(gdriveToken,gdriveFileId,updated);
         if(newId!==gdriveFileId){ setGdriveFileId(newId); await store.set(KEY_GDRIVE_FILE_ID,newId); }
+        await store.set(KEY_SESSIONS,JSON.stringify(updated)); // local cache
       }catch(e){
         showToast("⚠ Drive保存失敗: "+e.message,"err");
         await store.set(KEY_SESSIONS,JSON.stringify(updated));
       }
-    } else if(saveMode==="local"&&dirHandle){
+    } else if(saveMode==="local"&&dirHandle&&!IS_CLAUDE){
       const ok=await writeLocalFile(dirHandle,updated);
       if(!ok) showToast("⚠ ファイル保存に失敗しました","err");
     } else {
@@ -1610,10 +1614,13 @@ function App(){
       if(savedGdriveFid) setGdriveFileId(savedGdriveFid);
 
       if(IS_CLAUDE){
-        // Claude env: load from window.storage
+        // Claude env: load local cache first as fallback
         const raw=await store.get(KEY_SESSIONS);
         if(raw){ try{ const p=JSON.parse(raw); if(Array.isArray(p)) setSessions(p); }catch(e){} }
-        // Check if model is set
+        // Check storage mode (Claude env also supports Google Drive)
+        const mode=await store.get(KEY_SAVE_MODE)||"";
+        if(mode) setSaveMode(mode);
+        if(!mode){ setPhase("storageSetup"); return; }
         if(!savedModel){ setPhase("modelSetup"); return; }
         setPhase("ready");
       } else {
